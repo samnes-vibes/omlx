@@ -212,17 +212,10 @@ struct ServerHeroCard: View {
             buttons
         }
         .padding(18)
-        // Hero card surface: subtle accent gradient over a glass/material
-        // fill that's clipped to the rounded-rect outline. The gradient stays
-        // on top so the green/blue accent reads on both macOS 15 (over
-        // .thickMaterial) and macOS 26 (over real liquid glass).
+        // Hero card surface follows the grouped Settings style. Status is
+        // carried by the pill/actions, not by a colored background wash.
         .background(heroBackground)
-        .appGlass(.strong, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
-        )
         .padding(.horizontal, 14)
         .padding(.bottom, 14)
     }
@@ -328,23 +321,7 @@ struct ServerHeroCard: View {
 
     @ViewBuilder
     private var heroBackground: some View {
-        if theme.isDark {
-            LinearGradient(
-                colors: [
-                    Color(rgb24: 0x30D158, opacity: 0.08),
-                    Color(rgb24: 0x0A84FF, opacity: 0.06),
-                ],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        } else {
-            LinearGradient(
-                colors: [
-                    Color(rgb24: 0xF4FAF6),
-                    Color(rgb24: 0xF4F7FC),
-                ],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        }
+        theme.groupBg
     }
 }
 

@@ -53,7 +53,7 @@ struct Row<Trailing: View>: View {
                 Rectangle()
                     .fill(theme.rowSep)
                     .frame(height: 0.5)
-                    .padding(.leading, 14)
+                    .padding(.horizontal, 14)
             }
         }
     }
@@ -92,7 +92,7 @@ struct FreeRow<Content: View>: View {
                     Rectangle()
                         .fill(theme.rowSep)
                         .frame(height: 0.5)
-                        .padding(.leading, 14)
+                        .padding(.horizontal, 14)
                 }
             }
     }
