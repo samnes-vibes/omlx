@@ -162,6 +162,12 @@ class TestFunctionCallAndToolCall:
         assert fc.name == "Bash"
         assert fc.arguments == "{}"
 
+    def test_function_call_rejects_non_string_name(self):
+        """Name normalization must not widen FunctionCall.name beyond str."""
+        for name in (None, 123, {"name": "Bash"}, ["Bash"]):
+            with pytest.raises(ValidationError):
+                FunctionCall(name=name, arguments={})
+
     def test_tool_call(self):
         """Test creating tool call."""
         tc = ToolCall(

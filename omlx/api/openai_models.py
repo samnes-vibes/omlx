@@ -149,7 +149,7 @@ class FunctionCall(BaseModel):
     @field_validator("name", mode="before")
     @classmethod
     def _normalize_name(cls, v: Any) -> str:
-        return str(v).strip() if v is not None else ""
+        return v.strip() if isinstance(v, str) else v
 
     @field_validator("arguments", mode="before")
     @classmethod
