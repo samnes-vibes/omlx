@@ -513,7 +513,10 @@ class NetworkSettings:
 class SamplingSettings:
     """Default sampling parameters for generation."""
 
-    max_context_window: int = 32768
+    # 1 M acts as "no policy" — the model's native context length wins
+    # in ``server.get_max_context_window`` unless the operator lowers
+    # this to engage it as a real cap.
+    max_context_window: int = 1_000_000
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -535,7 +538,7 @@ class SamplingSettings:
     def from_dict(cls, data: dict[str, Any]) -> SamplingSettings:
         """Create from dictionary."""
         return cls(
-            max_context_window=data.get("max_context_window", 32768),
+            max_context_window=data.get("max_context_window", 1_000_000),
             max_tokens=data.get("max_tokens", 32768),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p", 0.95),

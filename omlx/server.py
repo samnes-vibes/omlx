@@ -198,7 +198,10 @@ class EngineType(Enum):
 class SamplingDefaults:
     """Default sampling parameters."""
 
-    max_context_window: int = 32768
+    # 1 M acts as "no policy" — the model's native context length wins
+    # in ``get_max_context_window`` unless the operator lowers this to
+    # engage it as a real cap.
+    max_context_window: int = 1_000_000
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -1135,14 +1138,26 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
-    Priority (#1308):
-        1. Explicit per-model setting (admin UI / settings.json override).
-        2. Context length discovered from the model's ``config.json`` at
-           server startup (``max_position_embeddings`` etc.); without
-           this tier the server would advertise the 32 K global default
-           even for models that declare 256 K+ natively.
-        3. Global default from ``SamplingConfig`` — last-resort fallback
-           for models whose config files don't expose a context length.
+    Resolution (refined from #1308 to make the global setting behave as
+    a user policy cap instead of a silent fallback default):
+
+        1. **Per-model override** (admin UI / settings.json) — always
+           wins. An operator who has set a per-model number knows what
+           they want.
+        2. ``min(model_native, global_policy)`` — clamp the model's
+           natively-declared context length (from its ``config.json``
+           ``max_position_embeddings`` etc.) by the operator's global
+           policy. So if the global is 128 K and the model declares
+           256 K, the effective cap is 128 K. If the global is 1 M
+           (default — effectively "no policy") and the model declares
+           256 K, the effective cap is 256 K.
+        3. Either value alone when the other is absent.
+
+    The default for ``SamplingSettings.max_context_window`` is set
+    deliberately large (1 M) so unconfigured installs let big models
+    use their full native context. Lowering the global value engages
+    it as a real cap across every model that doesn't have its own
+    per-model override.
 
     Returns:
         Max context window token count, or ``None`` if no tier resolves
@@ -1156,16 +1171,21 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
+    # Priority 1: explicit per-model override
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
 
+    # Priority 2: min(model_native, global_policy)
+    native: int | None = None
     pool = _server_state.engine_pool
     if model_id and pool is not None:
         entry = pool.get_entry(model_id)
         if entry is not None and entry.model_context_length is not None:
-            return entry.model_context_length
+            native = entry.model_context_length
 
-    return _server_state.sampling.max_context_window
+    policy = _server_state.sampling.max_context_window
+    candidates = [c for c in (native, policy) if c]
+    return min(candidates) if candidates else None
 
 
 def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:

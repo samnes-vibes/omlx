@@ -73,6 +73,82 @@ class TestGetMaxContextWindow:
             result = get_max_context_window(None)
             assert result == 16384
 
+    def test_global_clamps_model_native(self):
+        """Global policy below the model's native length wins as a cap.
+
+        Regression guard for the semantic shift documented in
+        ``get_max_context_window``: a lower global value is now a real
+        policy, not a silent fallback default that the model could ignore.
+        """
+        from omlx.server import get_max_context_window
+
+        state = self._make_server_state(global_max_ctx=128_000)
+        # Per-model override absent, but engine_pool reports a native
+        # context length larger than the global policy cap.
+        mock_manager = MagicMock()
+        mock_manager.get_settings.return_value = ModelSettings(
+            max_context_window=None
+        )
+        state.settings_manager = mock_manager
+
+        mock_pool = MagicMock()
+        mock_entry = MagicMock()
+        mock_entry.model_context_length = 262_144
+        mock_pool.get_entry.return_value = mock_entry
+        state.engine_pool = mock_pool
+
+        with patch("omlx.server._server_state", state):
+            result = get_max_context_window("big-model")
+            assert result == 128_000, (
+                "Global policy of 128k must clamp a model that natively "
+                "declares 256k; got the model's native value instead"
+            )
+
+    def test_model_native_below_global_wins(self):
+        """When the model's native length is below the global policy, the
+        native value wins — global is only a *cap*, not a floor."""
+        from omlx.server import get_max_context_window
+
+        state = self._make_server_state(global_max_ctx=1_000_000)
+        mock_manager = MagicMock()
+        mock_manager.get_settings.return_value = ModelSettings(
+            max_context_window=None
+        )
+        state.settings_manager = mock_manager
+
+        mock_pool = MagicMock()
+        mock_entry = MagicMock()
+        mock_entry.model_context_length = 32_768
+        mock_pool.get_entry.return_value = mock_entry
+        state.engine_pool = mock_pool
+
+        with patch("omlx.server._server_state", state):
+            result = get_max_context_window("small-model")
+            assert result == 32_768
+
+    def test_per_model_override_wins_over_min(self):
+        """Per-model override beats the min(native, policy) clamp."""
+        from omlx.server import get_max_context_window
+
+        state = self._make_server_state(global_max_ctx=64_000)
+        mock_manager = MagicMock()
+        mock_manager.get_settings.return_value = ModelSettings(
+            max_context_window=200_000
+        )
+        state.settings_manager = mock_manager
+
+        mock_pool = MagicMock()
+        mock_entry = MagicMock()
+        mock_entry.model_context_length = 100_000
+        mock_pool.get_entry.return_value = mock_entry
+        state.engine_pool = mock_pool
+
+        with patch("omlx.server._server_state", state):
+            result = get_max_context_window("override-model")
+            # Per-model override (200k) wins even though min(native=100k,
+            # policy=64k) would otherwise yield 64k.
+            assert result == 200_000
+
 
 class TestValidateContextWindow:
     """Tests for validate_context_window()."""

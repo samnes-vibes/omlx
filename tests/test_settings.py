@@ -1634,7 +1634,11 @@ class TestSamplingSettings:
     def test_defaults(self):
         """Test default values."""
         settings = SamplingSettings()
-        assert settings.max_context_window == 32768
+        # Default is "no policy" (1 M) — the global value acts as a cap
+        # in ``server.get_max_context_window``, so the unconfigured
+        # default must not silently clamp models that natively support
+        # longer contexts.
+        assert settings.max_context_window == 1_000_000
         assert settings.max_tokens == 32768
         assert settings.temperature == 1.0
         assert settings.top_p == 0.95
@@ -1660,7 +1664,7 @@ class TestSamplingSettings:
     def test_from_dict_defaults(self):
         """Test from_dict uses defaults for missing fields."""
         settings = SamplingSettings.from_dict({})
-        assert settings.max_context_window == 32768
+        assert settings.max_context_window == 1_000_000
         assert settings.repetition_penalty == 1.0
 
 
