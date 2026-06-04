@@ -389,9 +389,6 @@ def launch_command(args, extra_args: list[str] | None = None):
     opus_model = cli_opus_model or settings_opus_model
     sonnet_model = cli_sonnet_model or settings_sonnet_model
     haiku_model = cli_haiku_model or settings_haiku_model
-    claude_has_tier_models = tool_name == "claude" and any(
-        (opus_model, sonnet_model, haiku_model)
-    )
 
     # Build headers for authenticated requests
     headers = {}
