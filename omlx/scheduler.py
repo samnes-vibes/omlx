@@ -47,6 +47,7 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
+from .utils.tokenizer import create_streaming_detokenizer
 
 # Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
 # stream when no per-engine stream is provided.
@@ -227,12 +228,6 @@ except ImportError:
     CacheTypeRegistry = None
     ModelCacheConfig = None
     HAS_CACHE_TYPE_HANDLERS = False
-
-# Import streaming detokenizer for proper UTF-8 handling
-try:
-    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-except ImportError:
-    NaiveStreamingDetokenizer = None
 
 # Import protocol-specific output parser support
 try:
@@ -1587,11 +1582,11 @@ class Scheduler:
         """
         if request_id not in self._request_detokenizers:
             # Always create a fresh detokenizer - no pooling to prevent state contamination
-            if hasattr(self.tokenizer, "detokenizer"):
-                detok = self.tokenizer.detokenizer
-            elif NaiveStreamingDetokenizer is not None:
-                detok = NaiveStreamingDetokenizer(self.tokenizer)
-            else:
+            detok = create_streaming_detokenizer(
+                self.tokenizer,
+                model_path=self.config.model_name,
+            )
+            if detok is None:
                 # Fallback: return None, we'll use decode([token])
                 return None
             detok.reset()
