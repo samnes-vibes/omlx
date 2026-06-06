@@ -5,8 +5,7 @@ from __future__ import annotations
 
 import sys
 
-
-DEFAULT_PROCESS_TITLE = "omlx"
+DEFAULT_PROCESS_TITLE = "omlx-server"
 
 
 def set_process_title(title: str = DEFAULT_PROCESS_TITLE) -> bool:
