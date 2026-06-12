@@ -10,7 +10,6 @@ from typing import Any, List
 
 from .openai_models import Message
 
-
 # =============================================================================
 # Partial Mode Detection
 # =============================================================================
@@ -206,6 +205,21 @@ _PRESERVE_BOUNDARY_KEY = "_preserve_role_boundary"
 # Match `role == "tool"` / `role == 'tool'` in a chat template.
 _TOOL_ROLE_CHECK_RE = re.compile(r"==\s*['\"]tool['\"]")
 
+_MID_SYSTEM_USER_MARKER = "__OMLX_MID_SYSTEM_PROBE_USER__"
+_MID_SYSTEM_MARKER = "__OMLX_MID_SYSTEM_PROBE_SYSTEM__"
+_MID_SYSTEM_ASSISTANT_MARKER = "__OMLX_MID_SYSTEM_PROBE_ASSISTANT__"
+_MID_SYSTEM_PROBE_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "omlx_probe_tool",
+            "description": "oMLX chat-template probe tool.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+]
+_MID_SYSTEM_PROBE_CACHE: dict[tuple[Any, ...], bool] = {}
+
 
 def _chat_template_supports_tool_role(tokenizer: Any) -> bool:
     """Check whether the tokenizer's chat template renders tool messages natively.
@@ -231,6 +245,275 @@ def _chat_template_supports_tool_role(tokenizer: Any) -> bool:
     if not _TOOL_ROLE_CHECK_RE.search(chat_template):
         return False
     return "tool_calls" in chat_template
+
+
+def _freeze_template_value(value: Any) -> Any:
+    """Convert chat-template kwargs into a hashable cache-key value."""
+    if isinstance(value, dict):
+        return tuple(
+            sorted((str(k), _freeze_template_value(v)) for k, v in value.items())
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_template_value(v) for v in value)
+    if isinstance(value, set):
+        return tuple(sorted(_freeze_template_value(v) for v in value))
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _mid_system_probe_cache_key(
+    tokenizer: Any,
+    *,
+    has_tools: bool,
+    chat_template_kwargs: dict[str, Any] | None,
+    placement: str,
+    is_partial: bool,
+) -> tuple[Any, ...]:
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if isinstance(chat_template, str):
+        template_fingerprint: Any = hash(chat_template)
+    else:
+        template_fingerprint = repr(chat_template)
+    return (
+        id(tokenizer),
+        template_fingerprint,
+        has_tools,
+        _freeze_template_value(chat_template_kwargs or {}),
+        placement,
+        is_partial,
+    )
+
+
+def _apply_mid_system_probe_template(
+    tokenizer: Any,
+    probe_messages: list[dict],
+    *,
+    has_tools: bool,
+    chat_template_kwargs: dict[str, Any] | None,
+    is_partial: bool,
+) -> str:
+    template_kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": not is_partial,
+    }
+    if is_partial:
+        template_kwargs["continue_final_message"] = True
+    if has_tools:
+        template_kwargs["tools"] = _MID_SYSTEM_PROBE_TOOL
+    if chat_template_kwargs:
+        template_kwargs.update(chat_template_kwargs)
+
+    try:
+        rendered = tokenizer.apply_chat_template(probe_messages, **template_kwargs)
+    except TypeError:
+        if chat_template_kwargs:
+            for key in chat_template_kwargs:
+                template_kwargs.pop(key, None)
+        template_kwargs.pop("tools", None)
+        template_kwargs.pop("enable_thinking", None)
+        rendered = tokenizer.apply_chat_template(probe_messages, **template_kwargs)
+
+    if isinstance(rendered, str):
+        return rendered
+    if isinstance(rendered, list):
+        return " ".join(str(token) for token in rendered)
+    return str(rendered)
+
+
+def chat_template_preserves_mid_system(
+    tokenizer: Any | None,
+    *,
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    placement: str = "tail",
+    is_partial: bool = False,
+) -> bool:
+    """Return whether the chat template renders a mid-system message in-place.
+
+    This does not prove model-level semantics. It only verifies that the
+    current tokenizer template keeps the system content after the preceding
+    user turn instead of raising, dropping it, or moving it to the front.
+    """
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return False
+    if placement not in {"tail", "between"}:
+        return False
+
+    has_tools = bool(tools)
+    cache_key = _mid_system_probe_cache_key(
+        tokenizer,
+        has_tools=has_tools,
+        chat_template_kwargs=chat_template_kwargs,
+        placement=placement,
+        is_partial=is_partial,
+    )
+    cached = _MID_SYSTEM_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    probe_messages = [
+        {"role": "user", "content": _MID_SYSTEM_USER_MARKER},
+        {"role": "system", "content": _MID_SYSTEM_MARKER},
+    ]
+    if placement == "between":
+        probe_messages.append(
+            {"role": "assistant", "content": _MID_SYSTEM_ASSISTANT_MARKER}
+        )
+
+    try:
+        rendered = _apply_mid_system_probe_template(
+            tokenizer,
+            probe_messages,
+            has_tools=has_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+    except Exception:
+        _MID_SYSTEM_PROBE_CACHE[cache_key] = False
+        return False
+
+    user_idx = rendered.find(_MID_SYSTEM_USER_MARKER)
+    system_idx = rendered.find(_MID_SYSTEM_MARKER)
+    assistant_idx = rendered.find(_MID_SYSTEM_ASSISTANT_MARKER)
+
+    supported = user_idx >= 0 and system_idx > user_idx
+    if placement == "between":
+        supported = supported and assistant_idx > system_idx
+
+    _MID_SYSTEM_PROBE_CACHE[cache_key] = supported
+    return supported
+
+
+def _system_content_as_text(content: Any) -> str:
+    if isinstance(content, list):
+        return _extract_text_from_content_list(content)
+    return content if isinstance(content, str) else str(content)
+
+
+def _merge_consecutive_system_messages(messages: list[dict]) -> list[dict]:
+    """Merge adjacent system messages in-place without moving their position."""
+    merged: list[dict] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") != "system":
+            merged.append(msg)
+            i += 1
+            continue
+
+        parts: list[str] = []
+        while i < len(messages) and messages[i].get("role") == "system":
+            content = messages[i].get("content", "")
+            if content:
+                text = _system_content_as_text(content)
+                if text:
+                    parts.append(text)
+            i += 1
+
+        if parts:
+            merged.append({"role": "system", "content": "\n\n".join(parts)})
+
+    return merged
+
+
+def _mid_system_placement_kinds(messages: list[dict]) -> set[str] | None:
+    """Classify supported cache-preserving mid-system placements.
+
+    Returns None when any non-leading system run has an unsupported position.
+    """
+    placements: set[str] = set()
+    seen_non_system = False
+    i = 0
+    while i < len(messages):
+        role = messages[i].get("role")
+        if role != "system":
+            seen_non_system = True
+            i += 1
+            continue
+
+        start = i
+        while i < len(messages) and messages[i].get("role") == "system":
+            i += 1
+
+        if not seen_non_system:
+            continue
+
+        prev_role = messages[start - 1].get("role") if start > 0 else None
+        next_role = messages[i].get("role") if i < len(messages) else None
+        if prev_role != "user":
+            return None
+        if next_role is None:
+            placements.add("tail")
+        elif next_role == "assistant":
+            placements.add("between")
+        else:
+            return None
+
+    return placements
+
+
+def has_nonleading_system_message(messages: list[dict]) -> bool:
+    """Return True when a system message appears after a non-system turn."""
+    seen_non_system = False
+    for msg in messages:
+        if msg.get("role") == "system":
+            if seen_non_system:
+                return True
+        else:
+            seen_non_system = True
+    return False
+
+
+def prepare_system_messages_for_template(
+    messages: list[dict],
+    tokenizer: Any | None,
+    *,
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    is_partial: bool = False,
+    merge_consecutive_roles: bool = True,
+) -> list[dict]:
+    """Preserve cache-friendly mid-system turns when the template supports them.
+
+    Unsupported placements or templates fall back to the historical behavior:
+    all system messages are consolidated at the front.
+    """
+    messages = [dict(msg) for msg in messages]
+    placements = _mid_system_placement_kinds(messages)
+    if not placements:
+        if placements is None:
+            prepared = _consolidate_system_messages(messages)
+            if merge_consecutive_roles:
+                prepared = _merge_consecutive_roles(prepared)
+            return prepared
+        return _merge_consecutive_system_messages(messages)
+
+    if is_partial:
+        prepared = _consolidate_system_messages(messages)
+        if merge_consecutive_roles:
+            prepared = _merge_consecutive_roles(prepared)
+        return prepared
+
+    can_preserve = all(
+        chat_template_preserves_mid_system(
+            tokenizer,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            placement=placement,
+            is_partial=is_partial,
+        )
+        for placement in placements
+    )
+    if can_preserve:
+        return _merge_consecutive_system_messages(messages)
+
+    prepared = _consolidate_system_messages(messages)
+    if merge_consecutive_roles:
+        prepared = _merge_consecutive_roles(prepared)
+    return prepared
 
 
 def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
@@ -371,6 +654,7 @@ def extract_text_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
+    consolidate_system_messages: bool = True,
 ) -> List[dict]:
     """
     Extract text content from OpenAI-format messages.
@@ -388,6 +672,10 @@ def extract_text_content(
         native_reasoning_content: If True, pass ``reasoning_content`` through
             as a message-level field (Qwen 3.6+ templates).  If False, inline
             ``<think>...</think>`` into content as a fallback.
+        consolidate_system_messages: If True, preserve historical strict-template
+            behavior by moving system messages to the front. Server code can
+            set this to False and call ``prepare_system_messages_for_template``
+            after tools/template kwargs are known.
 
     Returns:
         List of {"role": str, "content": str}
@@ -542,9 +830,10 @@ def extract_text_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content), **_extra})
 
-    return _merge_consecutive_roles(
-        _drop_void_assistant_messages(_consolidate_system_messages(processed_messages))
-    )
+    processed_messages = _drop_void_assistant_messages(processed_messages)
+    if consolidate_system_messages:
+        processed_messages = _consolidate_system_messages(processed_messages)
+    return _merge_consecutive_roles(processed_messages)
 
 
 def extract_multimodal_content(
@@ -552,6 +841,7 @@ def extract_multimodal_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
+    consolidate_system_messages: bool = True,
 ) -> List[dict]:
     """
     Extract content from messages, preserving image_url parts for VLM.
@@ -565,6 +855,7 @@ def extract_multimodal_content(
         tokenizer: Tokenizer instance for token counting and truncation.
         native_reasoning_content: If True, pass ``reasoning_content`` through
             as a message-level field.  See ``extract_text_content``.
+        consolidate_system_messages: See ``extract_text_content``.
 
     Returns:
         List of message dicts. Messages with images have content as list.
@@ -717,9 +1008,10 @@ def extract_multimodal_content(
         else:
             processed_messages.append({"role": role, "content": str(content), **_extra})
 
-    return _drop_void_assistant_messages(
-        _consolidate_system_messages(processed_messages)
-    )
+    processed_messages = _drop_void_assistant_messages(processed_messages)
+    if consolidate_system_messages:
+        processed_messages = _consolidate_system_messages(processed_messages)
+    return processed_messages
 
 
 # =============================================================================
@@ -781,6 +1073,7 @@ def extract_harmony_messages(
     messages: list,
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
+    consolidate_system_messages: bool = True,
 ) -> List[dict]:
     """
     Extract messages for Harmony (gpt-oss) models.
@@ -804,6 +1097,7 @@ def extract_harmony_messages(
         messages: List of Message objects
         max_tool_result_tokens: Maximum token count for tool results.
         tokenizer: Tokenizer instance for token counting and truncation.
+        consolidate_system_messages: See ``extract_text_content``.
 
     Returns:
         List of message dicts with tool-related fields preserved
@@ -925,9 +1219,11 @@ def extract_harmony_messages(
                             {
                                 "id": getattr(tc, "id", ""),
                                 "function": {
-                                    "name": getattr(tc.function, "name", "")
-                                    if hasattr(tc, "function")
-                                    else "",
+                                    "name": (
+                                        getattr(tc.function, "name", "")
+                                        if hasattr(tc, "function")
+                                        else ""
+                                    ),
                                     "arguments": _try_parse_json(args_str),
                                 },
                             }
@@ -951,6 +1247,7 @@ def extract_harmony_messages(
         else:
             processed_messages.append({"role": role, "content": str(content)})
 
-    return _merge_consecutive_roles(
-        _drop_void_assistant_messages(_consolidate_system_messages(processed_messages))
-    )
+    processed_messages = _drop_void_assistant_messages(processed_messages)
+    if consolidate_system_messages:
+        processed_messages = _consolidate_system_messages(processed_messages)
+    return _merge_consecutive_roles(processed_messages)

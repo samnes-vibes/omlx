@@ -40,6 +40,7 @@ The server provides:
 
 import argparse
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -134,13 +135,9 @@ from .api.rerank_models import (
     RerankUsage,
 )
 from .api.responses_models import (
-    OutputContent,
     OutputItem,
     ResponseObject,
     ResponsesRequest,
-    ResponsesTool,
-    ResponseUsage,
-    TextConfig,
 )
 from .api.responses_utils import (
     ResponseStateCorruptError,
@@ -164,19 +161,18 @@ from .api.tool_calling import (
     enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
     parse_json_output,
-    parse_tool_calls,
-    parse_tool_calls_with_thinking_fallback,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
 )
 from .api.utils import (
-    clean_output_text,
     clean_special_tokens,
     detect_and_strip_partial,
     extract_multimodal_content,
     extract_text_content,
+    has_nonleading_system_message,
+    prepare_system_messages_for_template,
 )
-from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
+from .engine import BaseEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -190,7 +186,6 @@ from .exceptions import (
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
-from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -1304,6 +1299,17 @@ def resolve_model_id(model_id: str | None) -> str | None:
     if pool is None:
         return model_id
     return pool.resolve_model_id(model_id, _server_state.settings_manager)
+
+
+async def _ensure_tokenizer_for_system_probe(
+    engine: BaseEngine, messages: list
+) -> None:
+    """Load lazy engines before probing mid-conversation system placement."""
+    if not has_nonleading_system_message(messages):
+        return
+    if getattr(engine, "tokenizer", None) is not None:
+        return
+    await engine.start()
 
 
 def _format_generation_speed_for_log(
@@ -2893,8 +2899,21 @@ async def create_chat_completion(
         engine, "supports_multimodal_fallback", False
     )
     extractor = getattr(engine, "message_extractor", None)
+    merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
     if extractor is not None:
-        messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
+        extractor_kwargs = {}
+        try:
+            if "consolidate_system_messages" in inspect.signature(extractor).parameters:
+                extractor_kwargs["consolidate_system_messages"] = False
+        except (TypeError, ValueError):
+            pass
+        messages = extractor(
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            **extractor_kwargs,
+        )
+        merge_system_fallback_roles = True
     elif is_vlm or is_dflash_vlm:
         # VLM or DFlash with VLM fallback: preserve image_url content parts
         messages = extract_multimodal_content(
@@ -2902,6 +2921,7 @@ async def create_chat_completion(
             max_tool_result_tokens,
             engine.tokenizer,
             native_reasoning_content=native_reasoning,
+            consolidate_system_messages=False,
         )
     else:
         messages = extract_text_content(
@@ -2909,6 +2929,7 @@ async def create_chat_completion(
             max_tool_result_tokens,
             engine.tokenizer,
             native_reasoning_content=native_reasoning,
+            consolidate_system_messages=False,
         )
 
     # Detect and strip partial mode at the API boundary — exactly once,
@@ -2981,6 +3002,15 @@ async def create_chat_completion(
     # Gemma 4 drops required params that lack descriptions — enrich them
     if tools_for_template and "gemma" in (resolved_model or "").lower():
         tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
+    await _ensure_tokenizer_for_system_probe(engine, messages)
+    messages = prepare_system_messages_for_template(
+        messages,
+        engine.tokenizer,
+        tools=tools_for_template,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        is_partial=is_partial,
+        merge_consecutive_roles=merge_system_fallback_roles,
+    )
     try:
         num_prompt_tokens = engine.count_chat_tokens(
             messages,
@@ -3273,13 +3303,18 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     messages = list(messages)  # Make a copy
 
-    # Find existing system message
+    # Only attach to a leading system message. A mid-conversation system
+    # message may be intentionally placed there to preserve prefix cache hits.
     system_idx = None
-    for i, msg in enumerate(messages):
-        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+    if messages:
+        first = messages[0]
+        role = (
+            first.get("role")
+            if isinstance(first, dict)
+            else getattr(first, "role", None)
+        )
         if role == "system":
-            system_idx = i
-            break
+            system_idx = 0
 
     if system_idx is not None:
         # Append to existing system message
@@ -4636,7 +4671,10 @@ async def create_anthropic_message(
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
-            request, max_tool_result_tokens, engine.tokenizer
+            request,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            consolidate_system_messages=False,
         )
     else:
         messages = convert_anthropic_to_internal(
@@ -4645,13 +4683,27 @@ async def create_anthropic_message(
             engine.tokenizer,
             preserve_images=is_vlm or is_dflash_vlm,
             native_reasoning_content=native_reasoning,
+            consolidate_system_messages=False,
         )
 
     # Apply model-specific message extraction (e.g. Gemma 4 converts
     # role=tool messages into tool_responses on assistant turns).
     extractor = getattr(engine, "message_extractor", None)
+    merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
     if extractor is not None:
-        messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
+        extractor_kwargs = {}
+        try:
+            if "consolidate_system_messages" in inspect.signature(extractor).parameters:
+                extractor_kwargs["consolidate_system_messages"] = False
+        except (TypeError, ValueError):
+            pass
+        messages = extractor(
+            messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            **extractor_kwargs,
+        )
+        merge_system_fallback_roles = True
 
     # Detect and strip partial mode at the API boundary — exactly once.
     is_partial = detect_and_strip_partial(messages)
@@ -4748,6 +4800,16 @@ async def create_anthropic_message(
 
     # Forward partial-mode decision to the engine explicitly
     chat_kwargs["is_partial"] = is_partial
+
+    await _ensure_tokenizer_for_system_probe(engine, messages)
+    messages = prepare_system_messages_for_template(
+        messages,
+        engine.tokenizer,
+        tools=internal_tools,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        is_partial=is_partial,
+        merge_consecutive_roles=merge_system_fallback_roles,
+    )
 
     # Validate context window before sending to model
     try:
@@ -5014,7 +5076,10 @@ async def create_response(
 
     resolved_model = resolve_model_id(request.model) or request.model
 
-    current_input_messages = convert_responses_input_to_messages(request.input)
+    current_input_messages = convert_responses_input_to_messages(
+        request.input,
+        consolidate_system_messages=False,
+    )
 
     # Build previous context from previous_response_id
     previous_messages = None
@@ -5025,7 +5090,10 @@ async def create_response(
 
     # Convert Responses API input → internal messages
     messages = convert_responses_input_to_messages(
-        request.input, request.instructions, previous_messages
+        request.input,
+        request.instructions,
+        previous_messages,
+        consolidate_system_messages=False,
     )
 
     # Convert tools: flat → nested
@@ -5037,17 +5105,13 @@ async def create_response(
         )
 
     # Get per-model settings
-    max_tool_result_tokens = None
     merged_ct_kwargs = {}
-    forced_keys: set[str] = set()
     reasoning_parser = None
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved_model)
-        max_tool_result_tokens = ms.max_tool_result_tokens
         reasoning_parser = ms.reasoning_parser
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
-        forced_keys = set(ms.forced_ct_kwargs or [])
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
@@ -5112,6 +5176,15 @@ async def create_response(
     # Gemma 4 drops required params that lack descriptions — enrich them
     if tools_for_template and "gemma" in (resolved_model or "").lower():
         tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
+    await _ensure_tokenizer_for_system_probe(engine, messages)
+    messages = prepare_system_messages_for_template(
+        messages,
+        engine.tokenizer,
+        tools=tools_for_template,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        is_partial=False,
+        merge_consecutive_roles=True,
+    )
 
     # Validate context window
     try:
