@@ -28,7 +28,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.31.2",
+    # oMLX GLM-5.2 custom kernels based on MLX v0.31.2.
+    "mlx @ git+https://github.com/jundot/mlx.git@v0.31.2-omlx",
     # mlx-lm from commit (2c008fd, v0.31.3) - trust_remote_code load gate,
     # transformers 5.7.0 compatibility, and prior BatchGenerator/cache fixes.
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
@@ -197,9 +198,10 @@ include = ["omlx*"]
 "omlx.eval" = ["data/*.jsonl"]
 
 [tool.uv]
-# mlx-lm is pinned to a git commit; override transitive pins
-# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+# mlx and mlx-lm are git-pinned; override transitive pins
+# (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
+    "mlx @ git+https://github.com/jundot/mlx.git@v0.31.2-omlx",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
 ]
 

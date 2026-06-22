@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -95,6 +96,76 @@ def test_pre_load_dispatch_applies_glm_patch(tmp_path, monkeypatch):
     apply_mock.assert_called_once_with()
 
 
+def test_glm_adaptive_prefill_config_defaults_and_gates(monkeypatch):
+    from omlx.patches.glm_moe_dsa.generate_patch import (
+        _glm_dsa_adaptive_prefill_config,
+        _prefill_step_size_for_progress,
+    )
+
+    env_names = [
+        "MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP",
+        "MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP_SIZE",
+        "MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_AFTER",
+        "MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_MIN_REMAINING",
+    ]
+    for name in env_names:
+        monkeypatch.delenv(name, raising=False)
+
+    model = SimpleNamespace(model_type="glm_moe_dsa")
+    cfg = _glm_dsa_adaptive_prefill_config(model, 2048)
+    assert cfg is not None
+    assert cfg.step_size == 6144
+    assert cfg.after == 0
+    assert cfg.min_remaining == 0
+    assert _prefill_step_size_for_progress(2048, 0, 8192, cfg) == 6144
+
+    assert _glm_dsa_adaptive_prefill_config(model, 1024) is None
+    assert (
+        _glm_dsa_adaptive_prefill_config(
+            SimpleNamespace(model_type="deepseek_v32"), 2048
+        )
+        is None
+    )
+
+    monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", "0")
+    assert _glm_dsa_adaptive_prefill_config(model, 2048) is None
+
+
+def test_glm_adaptive_prefill_config_env_overrides(monkeypatch):
+    from omlx.patches.glm_moe_dsa.generate_patch import (
+        _glm_dsa_adaptive_prefill_config,
+        _prefill_step_size_for_progress,
+    )
+
+    monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", "1")
+    monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP_SIZE", "4096")
+    monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_AFTER", "8192")
+    monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_MIN_REMAINING", "2048")
+
+    cfg = _glm_dsa_adaptive_prefill_config(
+        SimpleNamespace(args=SimpleNamespace(model_type="glm_moe_dsa")), 2048
+    )
+    assert cfg is not None
+    assert cfg.step_size == 4096
+    assert cfg.after == 8192
+    assert cfg.min_remaining == 2048
+    assert _prefill_step_size_for_progress(2048, 4096, 4096, cfg) == 2048
+    assert _prefill_step_size_for_progress(2048, 8192, 1024, cfg) == 2048
+    assert _prefill_step_size_for_progress(2048, 8192, 2048, cfg) == 4096
+
+
+def test_glm_patch_keeps_vendored_helpers_private():
+    glm_moe_dsa = _load_patched_glm_module()
+
+    from omlx.patches.glm_moe_dsa import deepseek_v32 as vendored_deepseek_v32
+    from mlx_lm.models import deepseek_v32 as upstream_deepseek_v32
+
+    assert getattr(glm_moe_dsa, "_OMLX_GLM_DSA_OPTIMIZED", False)
+    assert sys.modules["mlx_lm.models.glm_moe_dsa"] is glm_moe_dsa
+    assert glm_moe_dsa.DeepseekV32Model is vendored_deepseek_v32.DeepseekV32Model
+    assert upstream_deepseek_v32 is not vendored_deepseek_v32
+
+
 def test_glm_patch_installs_native_indexer_schedule():
     glm_moe_dsa = _load_patched_glm_module()
 
@@ -113,9 +184,14 @@ def test_glm_patch_installs_native_indexer_schedule():
     ]
 
     model = glm_moe_dsa.Model(args)
-    assert [
-        layer.self_attn.indexer is not None for layer in model.model.layers
-    ] == [True, False, True, False, True, False]
+    assert [layer.self_attn.indexer is not None for layer in model.model.layers] == [
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+    ]
     assert [len(c.caches) for c in model.make_cache()] == [2, 1, 2, 1, 2, 1]
 
 
