@@ -6,6 +6,7 @@ from setuptools import setup
 
 CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
 TRUTHY = {"1", "true", "yes", "on"}
+DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"
 
 
 def _with_custom_kernel() -> bool:
@@ -18,6 +19,19 @@ def _with_custom_kernel() -> bool:
 def _custom_kernel_build_kwargs() -> dict:
     if not _with_custom_kernel():
         return {}
+
+    target = (
+        os.environ.get("OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET")
+        or os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+        or DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET
+    )
+    os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", target)
+    cmake_args = os.environ.get("CMAKE_ARGS", "").strip()
+    if "CMAKE_OSX_DEPLOYMENT_TARGET" not in cmake_args:
+        target_arg = f"-DCMAKE_OSX_DEPLOYMENT_TARGET={target}"
+        os.environ["CMAKE_ARGS"] = (
+            f"{cmake_args} {target_arg}".strip() if cmake_args else target_arg
+        )
 
     from mlx import extension
 

@@ -51,14 +51,8 @@ def missing_symbols(required: tuple[str, ...]) -> list[str]:
 
 def _native_stream_kwargs(stream) -> dict[str, object]:
     """Accept the same stream shorthand that mlx.fast kernels accept."""
-    if (
-        stream is None
-        or isinstance(stream, mx.DeviceType)
-        or isinstance(stream, mx.Device)
-    ):
-        return {}
     if isinstance(stream, mx.DeviceType):
-        return {}
+        stream = None
     return {"stream": stream}
 
 
