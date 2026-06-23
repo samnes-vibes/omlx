@@ -12,38 +12,11 @@ struct OMLXDSATopKParams {
   bool causal_valid_prefix;
 };
 
-struct OMLXDSATopKBlockTableParams {
-  int rows;
-  int L;
-  int K;
-  int topk;
-  int k_block_size;
-  int causal;
-};
-
-struct OMLXDSATopKQBlockUnionParams {
-  int blocks;
-  int L;
-  int K;
-  int topk_rows;
-  int topk;
-  int q_block_size;
-  int capacity;
-  int causal;
-  int topk_valid_prefix;
-  int causal_prefix_indices;
-  int causal_prefix_rows;
-};
-
 } // namespace steel
 } // namespace mlx
 
 #define DSATopKParams OMLXDSATopKParams
-#define DSATopKBlockTableParams OMLXDSATopKBlockTableParams
-#define DSATopKQBlockUnionParams OMLXDSATopKQBlockUnionParams
 #include "kernels/steel_dsa_indexer_score.h"
-#undef DSATopKQBlockUnionParams
-#undef DSATopKBlockTableParams
 #undef DSATopKParams
 
 #define instantiate_dsa_indexer_score(iname, itype, bm, bn, bk, wm, wn) \

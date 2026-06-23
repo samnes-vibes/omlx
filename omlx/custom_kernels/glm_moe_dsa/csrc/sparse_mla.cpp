@@ -202,13 +202,9 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
         flags);
 
     const bool do_causal = do_causal_;
-    const bool direct_q_load =
-        std::getenv("MLX_LM_GLM_DSA_SPARSE_MLA_DIRECT_Q_LOAD") != nullptr &&
-        std::string(std::getenv("MLX_LM_GLM_DSA_SPARSE_MLA_DIRECT_Q_LOAD")) ==
-            "1";
     metal::MTLFCList func_consts = {
         {&do_causal, MTL::DataType::DataTypeBool, 301},
-        {&direct_q_load, MTL::DataType::DataTypeBool, 307}};
+    };
 
     std::string base_name;
     concatenate(
@@ -233,9 +229,7 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
         hash_name,
         base_name,
         "_do_causal_",
-        (do_causal ? 't' : 'n'),
-        "_direct_q_",
-        (direct_q_load ? 't' : 'n'));
+        (do_causal ? 't' : 'n'));
 
     auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
     auto& compute_encoder = metal::get_command_encoder(s);

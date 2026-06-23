@@ -37,17 +37,13 @@ struct DSATopKParams {
   bool causal_valid_prefix;
 };
 
-struct DSATopKBlockTableParams {
-  int rows;
-  int L;
-  int K;
-  int topk;
-  int k_block_size;
-  int causal;
-};
-
 bool row_contiguous(const array& arr) {
-  return arr.flags().row_contiguous && arr.strides(-1) == 1;
+  return arr.flags().row_contiguous && arr.strides(-1) == 1 &&
+      arr.offset() == 0;
+}
+
+array ensure_row_contiguous(const array& arr, Stream stream) {
+  return contiguous(arr, false, stream);
 }
 
 class DSAIndexerScoresPrimitive : public Primitive {
@@ -80,7 +76,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
     if (q.dtype() != float16 && q.dtype() != bfloat16) {
       return true;
     }
-    if (!row_contiguous(q) || !row_contiguous(k) || !row_contiguous(weights)) {
+    if (!row_contiguous(q) || !row_contiguous(k) ||
+        !row_contiguous(weights)) {
       return true;
     }
     if (q.ndim() != 4 || k.ndim() != 4 ||
@@ -108,9 +105,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
         q.shape(3) % 16 != 0) {
       return true;
     }
-    const char* min_k_env = std::getenv("MLX_LM_GLM_DSA_INDEXER_MIN_K");
-    const int min_k = min_k_env == nullptr ? 4096 : std::atoi(min_k_env);
-    return k.shape(2) < min_k;
+    return k.shape(2) < 4096;
   }
 
   void eval_cpu(
@@ -164,16 +159,9 @@ class DSAIndexerScoresPrimitive : public Primitive {
 
     bool do_causal = causal_;
     bool use_weights_lh = weights_lh_;
-    bool pair_heads =
-        H % 2 == 0 &&
-        std::getenv("MLX_LM_GLM_DSA_INDEXER_PAIR_HEADS") != nullptr &&
-        std::string(std::getenv("MLX_LM_GLM_DSA_INDEXER_PAIR_HEADS")) == "1";
-    bool emit_high_histogram = false;
     metal::MTLFCList func_consts = {
         {&do_causal, MTL::DataType::DataTypeBool, 300},
         {&use_weights_lh, MTL::DataType::DataTypeBool, 301},
-        {&pair_heads, MTL::DataType::DataTypeBool, 304},
-        {&emit_high_histogram, MTL::DataType::DataTypeBool, 305},
     };
 
     std::string base_name;
@@ -199,10 +187,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
         "_causal_",
         (do_causal ? 't' : 'n'),
         "_wlh_",
-        (use_weights_lh ? 't' : 'n'),
-        "_pairh_",
-        (pair_heads ? 't' : 'n'),
-        "_hh_n");
+        (use_weights_lh ? 't' : 'n'));
 
     auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
     auto& compute_encoder = metal::get_command_encoder(s);
@@ -384,13 +369,15 @@ array dsa_topk_indices_impl(
   }
 
   auto stream = to_stream(s);
-  std::vector<array> inputs = {scores};
-  if (DSATopKIndicesPrimitive::unsupported(scores, topk, stream)) {
+  auto scores_contiguous = ensure_row_contiguous(scores, stream);
+  std::vector<array> inputs = {scores_contiguous};
+  if (DSATopKIndicesPrimitive::unsupported(scores_contiguous, topk, stream)) {
     throw std::invalid_argument(
         "[omlx_glm_kernels.dsa_topk_indices] unsupported M3 GLM shape.");
   }
 
-  Shape out_shape{scores.shape(0), 1, scores.shape(2), topk};
+  Shape out_shape{
+      scores_contiguous.shape(0), 1, scores_contiguous.shape(2), topk};
   return array(
       std::move(out_shape),
       uint32,
@@ -464,9 +451,9 @@ array dsa_indexer_scores(
   }
 
   auto stream = to_stream(s);
-  auto q = astype(queries, final_type, stream);
-  auto k = astype(keys, final_type, stream);
-  auto w = astype(weights, final_type, stream);
+  auto q = ensure_row_contiguous(astype(queries, final_type, stream), stream);
+  auto k = ensure_row_contiguous(astype(keys, final_type, stream), stream);
+  auto w = ensure_row_contiguous(astype(weights, final_type, stream), stream);
 
   std::vector<array> inputs = {q, k, w};
   if (DSAIndexerScoresPrimitive::unsupported(q, k, w, stream)) {

@@ -195,6 +195,18 @@ def test_glm_patch_installs_native_indexer_schedule():
     assert [len(c.caches) for c in model.make_cache()] == [2, 1, 2, 1, 2, 1]
 
 
+def test_glm_direct_sparse_mla_uses_fork_default_threshold(monkeypatch):
+    from omlx.patches.glm_moe_dsa import glm_moe_dsa_model
+
+    monkeypatch.setattr(
+        glm_moe_dsa_model.glm_fast,
+        "has",
+        lambda name: name == "glm_dsa_sparse_mla_attention",
+    )
+
+    assert glm_moe_dsa_model._native_sparse_mla_default_min_k() == "11264"
+
+
 def test_glm_native_fused_kernels_match_reference(monkeypatch):
     mx = pytest.importorskip("mlx.core")
 
@@ -248,6 +260,57 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     mx.eval(y_native, y_ref)
     assert float(mx.max(mx.abs(y_native - y_ref)).item()) <= 0.125
 
+    from omlx.patches.glm_moe_dsa.sparse_mla import fused_indexer_scores
+
+    def assert_padded_indexer_scores_match(L, K, offset_view=False):
+        B, H, D = 1, 32, 128
+        if offset_view:
+            q_base = mx.random.normal((B, H, L + 2, D), dtype=mx.float16)
+            k_base = mx.random.normal((B, 1, K + 2, D), dtype=mx.float16)
+            w_base = mx.random.normal((B, L + 2, H), dtype=mx.float16)
+            q = q_base[:, :, 1 : L + 1, :]
+            k = k_base[:, :, 1 : K + 1, :]
+            w = w_base[:, 1 : L + 1, :]
+        else:
+            q = mx.random.normal((B, H, L, D), dtype=mx.float16)
+            k = mx.random.normal((B, 1, K, D), dtype=mx.float16)
+            w = mx.random.normal((B, L, H), dtype=mx.float16)
+        y_native = fused_indexer_scores(q, k, w, causal=True)
+        head_scores = q @ k.swapaxes(-1, -2)
+        y_ref = mx.maximum(head_scores, 0)
+        y_ref = mx.sum(
+            y_ref * w.swapaxes(-1, -2)[..., None],
+            axis=1,
+            keepdims=True,
+        )
+        q_pos = mx.arange(K - L, K, dtype=mx.uint32).reshape(1, 1, L, 1)
+        k_pos = mx.arange(0, K, dtype=mx.uint32).reshape(1, 1, 1, K)
+        y_ref = mx.where(
+            k_pos <= q_pos,
+            y_ref,
+            mx.array(-float("inf"), dtype=y_ref.dtype),
+        )
+        mx.eval(y_native, y_ref)
+        valid = mx.isfinite(y_ref)
+        future_finite = mx.sum(
+            mx.where(~valid, mx.isfinite(y_native), mx.array(False))
+        )
+        diff = mx.max(
+            mx.where(
+                valid,
+                mx.abs(y_native.astype(mx.float32) - y_ref.astype(mx.float32)),
+                mx.array(0.0),
+            )
+        )
+        assert int(future_finite.item()) == 0
+        assert float(diff.item()) <= 0.5
+
+    assert_padded_indexer_scores_match(128, 4210)
+    assert_padded_indexer_scores_match(100, 4200)
+    assert_padded_indexer_scores_match(128, 4210, offset_view=True)
+
+    assert not fast.has_symbol("glm_moe_swiglu_down")
+
     batch, heads, q_len, k_len, latent, pe = 1, 64, 2, 32, 512, 64
     scale = 0.05
     q_latent = mx.random.normal((batch, heads, q_len, latent), dtype=mx.float16)
@@ -290,6 +353,148 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     mx.eval(y_native, y_ref)
     assert float(mx.max(mx.abs(y_native - y_ref)).item()) <= 0.02
 
+    batch, heads, q_len, k_len, latent, pe, topk = 1, 64, 64, 64, 512, 64, 16
+    scale = 0.05
+    q_latent = mx.random.normal((batch, heads, q_len, latent), dtype=mx.float16)
+    q_pe = mx.random.normal((batch, heads, q_len, pe), dtype=mx.float16)
+    kv_latent = mx.random.normal((batch, 1, k_len, latent), dtype=mx.float16)
+    k_pe = mx.random.normal((batch, 1, k_len, pe), dtype=mx.float16)
+    rows = []
+    dense_rows = []
+    for q_pos in range(q_len):
+        start = max(0, q_pos - topk + 1)
+        ids = list(range(start, q_pos + 1))
+        rows.append(ids + ([0] * (topk - len(ids))))
+        selected = set(ids)
+        dense_rows.append([j in selected and j <= q_pos for j in range(k_len)])
+    topk_indices = mx.array([[rows]], dtype=mx.uint32)
+    y_native = fast.glm_dsa_sparse_mla_attention(
+        q_latent,
+        q_pe,
+        kv_latent,
+        k_pe,
+        topk_indices,
+        scale,
+        causal=True,
+        topk_valid_prefix=True,
+        causal_prefix_indices=True,
+    )
+    scores = mx.sum(
+        mx.expand_dims(q_latent, 3) * mx.expand_dims(kv_latent, 1),
+        axis=-1,
+    )
+    scores = scores + mx.sum(
+        mx.expand_dims(q_pe, 3) * mx.expand_dims(k_pe, 1),
+        axis=-1,
+    )
+    scores = scores * scale
+    dense_mask = mx.array([[dense_rows]], dtype=mx.bool_)
+    scores = mx.where(dense_mask, scores, mx.array(-65504.0, scores.dtype))
+    probs = mx.softmax(scores, axis=-1)
+    y_ref = mx.sum(
+        mx.expand_dims(probs, -1) * mx.expand_dims(kv_latent, 1),
+        axis=3,
+    )
+    mx.eval(y_native, y_ref)
+    subset_diff = mx.max(
+        mx.abs(y_native.astype(mx.float32) - y_ref.astype(mx.float32))
+    )
+    assert float(subset_diff.item()) <= 0.02
+
+    batch, heads, q_len, k_len, latent, pe, topk = 1, 64, 32, 64, 512, 64, 16
+    prefix_rows = 16
+    scale = 0.05
+    q_latent = mx.random.normal((batch, heads, q_len, latent), dtype=mx.float16)
+    q_pe = mx.random.normal((batch, heads, q_len, pe), dtype=mx.float16)
+    kv_latent = mx.random.normal((batch, 1, k_len, latent), dtype=mx.float16)
+    k_pe = mx.random.normal((batch, 1, k_len, pe), dtype=mx.float16)
+    rows = []
+    for q_pos in range(q_len):
+        q_abs = k_len - q_len + q_pos
+        if q_pos < prefix_rows:
+            rows.append(list(range(topk)))
+        else:
+            rows.append(list(range(q_abs - topk + 1, q_abs + 1)))
+    full_topk = mx.array([[rows]], dtype=mx.uint32)
+    suffix_topk = full_topk[:, :, prefix_rows:, :]
+    y_full = fast.glm_dsa_sparse_mla_attention(
+        q_latent,
+        q_pe,
+        kv_latent,
+        k_pe,
+        full_topk,
+        scale,
+        causal=True,
+        topk_valid_prefix=True,
+        causal_prefix_indices=True,
+    )
+    y_compact = fast.glm_dsa_sparse_mla_attention(
+        q_latent,
+        q_pe,
+        kv_latent,
+        k_pe,
+        suffix_topk,
+        scale,
+        causal=True,
+        topk_valid_prefix=True,
+        causal_prefix_indices=True,
+        causal_prefix_rows=prefix_rows,
+    )
+    mx.eval(y_full, y_compact)
+    compact_diff = mx.max(
+        mx.abs(y_full.astype(mx.float32) - y_compact.astype(mx.float32))
+    )
+    assert float(compact_diff.item()) <= 5e-4
+
+    if not fast.has_symbol("glm_dsa_exact_block_attention"):
+        pytest.skip("GLM exact block-token attention native kernel is unavailable")
+
+    from omlx.patches.glm_moe_dsa.sparse_mla import topk_indices_to_block_masks
+
+    batch, heads, q_len, k_len, dims, topk = 1, 2, 32, 32, 256, 8
+    scale = dims**-0.5
+    q = mx.random.normal((batch, heads, q_len, dims), dtype=mx.float16)
+    k = mx.random.normal((batch, heads, k_len, dims), dtype=mx.float16)
+    v = mx.random.normal((batch, heads, k_len, dims), dtype=mx.float16)
+    rows = []
+    dense_rows = []
+    for i in range(q_len):
+        start = max(0, i - topk + 1)
+        ids = list(range(start, i + 1))
+        rows.append(([0] * (topk - len(ids))) + ids)
+        selected = set(ids)
+        dense_rows.append([j in selected and j <= i for j in range(k_len)])
+    topk_indices = mx.array([[rows]], dtype=mx.uint32)
+    block_masks = topk_indices_to_block_masks(
+        topk_indices,
+        L=q_len,
+        K=k_len,
+        q_block_size=16,
+        k_block_size=8,
+    )
+    assert block_masks is not None
+    block_mask, block_token_mask = block_masks
+    y_native = fast.glm_dsa_exact_block_attention(
+        q,
+        k,
+        v,
+        block_mask,
+        block_token_mask,
+        scale,
+        causal=True,
+    )
+    dense_mask = mx.array([[dense_rows]], dtype=mx.bool_)
+    y_ref = mx.fast.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        scale=scale,
+        mask=dense_mask,
+    )
+    mx.eval(y_native, y_ref)
+    diff = mx.max(mx.abs(y_native.astype(mx.float32) - y_ref.astype(mx.float32)))
+    assert float(diff.item()) <= 2e-3
+
     scores = mx.random.normal((1, 1, 2, 2048), dtype=mx.float16)
     topk_indices = fast.dsa_topk_indices(
         scores,
@@ -301,7 +506,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     assert topk_indices.shape == (1, 1, 2, 2048)
 
 
-def test_glm_direct_sparse_mla_defaults_off_without_native(monkeypatch):
+def test_glm_direct_sparse_mla_threshold_requires_native(monkeypatch):
     glm_moe_dsa = _load_patched_glm_module()
 
     monkeypatch.setattr(
@@ -309,14 +514,15 @@ def test_glm_direct_sparse_mla_defaults_off_without_native(monkeypatch):
         "glm_fast",
         SimpleNamespace(has=lambda name: False),
     )
-    monkeypatch.delenv("MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA", raising=False)
 
     assert int(glm_moe_dsa._native_sparse_mla_default_min_k()) > 10**12
-    assert glm_moe_dsa._direct_sparse_mla_policy("0") == (False, False)
-    assert glm_moe_dsa._direct_sparse_mla_policy("1") == (True, False)
 
-    monkeypatch.setenv("MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA", "strict")
-    assert glm_moe_dsa._direct_sparse_mla_policy("0") == (True, True)
+    monkeypatch.setattr(
+        glm_moe_dsa,
+        "glm_fast",
+        SimpleNamespace(has=lambda name: name == "glm_dsa_sparse_mla_attention"),
+    )
+    assert glm_moe_dsa._native_sparse_mla_default_min_k() == "11264"
 
 
 def test_glm_sparse_topk_mask_fallback_matches_pure_mlx():

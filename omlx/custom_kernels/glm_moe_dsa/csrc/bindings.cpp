@@ -4,6 +4,7 @@
 #include <nanobind/stl/variant.h>
 
 #include "dsa_indexer.h"
+#include "exact_block_attention.h"
 #include "fused_moe.h"
 #include "sparse_mla.h"
 
@@ -46,6 +47,17 @@ NB_MODULE(_ext, m) {
       "causal_prefix_indices"_a = false,
       "topk_length"_a = nb::none(),
       "causal_prefix_rows"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "glm_dsa_exact_block_attention",
+      &omlx::glm_kernels::glm_dsa_exact_block_attention,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "block_mask"_a,
+      "block_token_mask"_a,
+      "scale"_a,
+      "causal"_a = true,
       "stream"_a = nb::none());
   m.def(
       "glm_dsa_q8_vup_flat",

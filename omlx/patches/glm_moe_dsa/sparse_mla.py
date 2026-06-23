@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from typing import Optional
 
@@ -11,135 +10,218 @@ import mlx.core as mx
 from .kernels import fast as glm_fast
 
 
-def scores_to_block_indices(
-    scores: mx.array,
-    *,
-    block_budget: int,
-    q_block_size: int = 8,
-    k_block_size: int = 16,
-    recent_blocks: int = 0,
-    sort_indices: bool = True,
-) -> Optional[mx.array]:
-    """Select a fixed K-block table from dense DSA indexer scores.
+@lru_cache(maxsize=None)
+def _make_topk_indices_to_block_masks_kernel():
+    if not mx.metal.is_available():
+        return None
 
-    The result is a page table shaped [B, 1, q_blocks, block_budget]. Each row
-    contains K-block ids, not token ids. This mirrors the sparse MLA metadata
-    consumed by CUDA serving engines while keeping the workspace bounded.
+    source = r"""
+        const uint elem = thread_position_in_grid.x;
+        const uint total = B * L * TOPK;
+        if (elem >= total) {
+          return;
+        }
+
+        const uint j = elem % TOPK;
+        const uint q_pos = (elem / TOPK) % L;
+        const uint b = elem / (TOPK * L);
+
+        const uint q_abs = (K - L) + q_pos;
+        if (CAUSAL_PREFIX_INDICES && q_pos < PREFIX_ROWS) {
+          const uint valid_length = min(uint(K), q_abs + 1);
+          const uint prefix_blocks =
+              (valid_length + uint(K_BLOCK) - 1) / uint(K_BLOCK);
+          if (j >= prefix_blocks) {
+            return;
+          }
+
+          const uint q_block = q_pos / Q_BLOCK;
+          const uint k_block = j;
+          if (q_block >= Q_BLOCKS || k_block >= K_BLOCKS) {
+            return;
+          }
+
+          const uint block_idx = (b * Q_BLOCKS + q_block) * K_BLOCKS + k_block;
+          block_mask[block_idx] = true;
+
+          const uint block_start = k_block * uint(K_BLOCK);
+          const uint tokens_in_block =
+              min(uint(K_BLOCK), valid_length - block_start);
+          const uint full_bits =
+              K_BLOCK == 32 ? 0xffffffffu : ((1u << K_BLOCK) - 1u);
+          const uint bits = tokens_in_block == K_BLOCK
+              ? full_bits
+              : ((1u << tokens_in_block) - 1u);
+          const uint token_idx = (b * L + q_pos) * K_BLOCKS + k_block;
+          block_token_mask[token_idx] = bits;
+          return;
+        }
+
+        const uint topk_row = COMPACT_PREFIX_TOPK ? q_pos - PREFIX_ROWS : q_pos;
+        const uint topk_elem = (b * TOPK_ROWS + topk_row) * TOPK + j;
+        const uint k_pos = topk_indices[topk_elem];
+        if (k_pos >= K) {
+          return;
+        }
+
+        if (CAUSAL && k_pos > q_abs) {
+          return;
+        }
+
+        const uint q_block = q_pos / Q_BLOCK;
+        const uint k_block = k_pos / K_BLOCK;
+        if (q_block >= Q_BLOCKS || k_block >= K_BLOCKS) {
+          return;
+        }
+
+        const uint block_idx = (b * Q_BLOCKS + q_block) * K_BLOCKS + k_block;
+        block_mask[block_idx] = true;
+
+        const uint bit = 1u << (k_pos - k_block * K_BLOCK);
+        const uint token_idx = (b * L + q_pos) * K_BLOCKS + k_block;
+        device atomic_uint* atomic_token_mask =
+            reinterpret_cast<device atomic_uint*>(block_token_mask);
+        atomic_fetch_or_explicit(
+            &atomic_token_mask[token_idx],
+            bit,
+            memory_order_relaxed);
     """
 
-    if scores.ndim != 4 or scores.shape[1] != 1 or block_budget <= 0:
+    return glm_fast.metal_kernel(
+        name="glm_dsa_topk_indices_to_block_masks",
+        input_names=["topk_indices"],
+        output_names=["block_mask", "block_token_mask"],
+        source=source,
+    )
+
+
+def topk_indices_to_block_masks(
+    topk_indices: mx.array,
+    *,
+    L: Optional[int] = None,
+    K: int,
+    q_block_size: int = 32,
+    k_block_size: int = 16,
+    causal: bool = True,
+    causal_prefix_indices: bool = False,
+    causal_prefix_rows: int = 0,
+    stream: Optional[mx.Stream] = None,
+) -> Optional[tuple[mx.array, mx.array]]:
+    """Build exact block and per-token masks for GLM DSA top-k attention."""
+
+    if (
+        topk_indices.ndim != 4
+        or topk_indices.shape[1] != 1
+        or k_block_size <= 0
+        or k_block_size > 32
+        or q_block_size <= 0
+    ):
         return None
 
-    B, _, L, K = scores.shape
+    B, _, L_in, topk = topk_indices.shape
+    L = L_in if L is None else L
+    causal_prefix_rows = max(0, min(causal_prefix_rows, L))
+    compact_prefix_topk = (
+        causal_prefix_indices
+        and causal_prefix_rows > 0
+        and L_in == L - causal_prefix_rows
+    )
+    if (L != L_in and not compact_prefix_topk) or K <= 0 or topk <= 0:
+        return None
+
     q_blocks = (L + q_block_size - 1) // q_block_size
     k_blocks = (K + k_block_size - 1) // k_block_size
-    block_budget = min(block_budget, k_blocks)
 
-    pad_value = mx.array(mx.finfo(scores.dtype).min, scores.dtype)
-    if K != k_blocks * k_block_size:
-        scores = mx.pad(
-            scores,
-            [(0, 0), (0, 0), (0, 0), (0, k_blocks * k_block_size - K)],
-            constant_values=pad_value,
-        )
-    block_scores = mx.max(
-        scores.reshape(B, 1, L, k_blocks, k_block_size),
-        axis=-1,
-    )
-    if L != q_blocks * q_block_size:
-        block_scores = mx.pad(
-            block_scores,
-            [(0, 0), (0, 0), (0, q_blocks * q_block_size - L), (0, 0)],
-            constant_values=pad_value,
-        )
-    block_scores = block_scores.reshape(B, 1, q_blocks, q_block_size, k_blocks)
-    block_scores = mx.max(block_scores, axis=3)
-
-    return block_scores_to_indices(
-        block_scores,
-        block_budget=block_budget,
-        recent_blocks=recent_blocks,
-        q_block_size=q_block_size,
-        k_block_size=k_block_size,
-        query_length=L,
-        key_length=K,
-        sort_indices=sort_indices,
-    )
-
-
-def _boost_recent_block_scores(
-    block_scores: mx.array,
-    *,
-    recent_blocks: int,
-    q_block_size: int,
-    k_block_size: int,
-    query_length: int,
-    key_length: int,
-) -> mx.array:
-    if recent_blocks <= 0:
-        return block_scores
-
-    q_blocks = block_scores.shape[-2]
-    k_blocks = block_scores.shape[-1]
-    recent_blocks = min(recent_blocks, k_blocks)
-
-    q_block = mx.arange(q_blocks, dtype=mx.uint32)[:, None]
-    k_block = mx.arange(k_blocks, dtype=mx.uint32)[None, :]
-    q_end_local = (
-        mx.minimum(
-            (q_block + 1) * q_block_size,
-            mx.array(query_length, dtype=mx.uint32),
-        )
-        - 1
-    )
-    q_abs_end = q_end_local + (key_length - query_length)
-    end_block = q_abs_end // k_block_size
-    recent_mask = (k_block <= end_block) & (k_block + recent_blocks > end_block)
-    recent_mask = mx.reshape(recent_mask, (1, 1, q_blocks, k_blocks))
-    boost_value = mx.array(mx.finfo(block_scores.dtype).max, block_scores.dtype)
-    return mx.where(recent_mask, boost_value, block_scores)
-
-
-def block_scores_to_indices(
-    block_scores: mx.array,
-    *,
-    block_budget: int,
-    recent_blocks: int = 0,
-    q_block_size: Optional[int] = None,
-    k_block_size: Optional[int] = None,
-    query_length: Optional[int] = None,
-    key_length: Optional[int] = None,
-    sort_indices: bool = True,
-) -> Optional[mx.array]:
-    """Select block ids from pre-reduced [B, 1, q_blocks, k_blocks] scores."""
-
-    if block_scores.ndim != 4 or block_scores.shape[1] != 1 or block_budget <= 0:
+    kernel = _make_topk_indices_to_block_masks_kernel()
+    if kernel is None:
         return None
 
-    block_budget = min(block_budget, block_scores.shape[-1])
-    if recent_blocks > 0:
-        if (
-            q_block_size is None
-            or k_block_size is None
-            or query_length is None
-            or key_length is None
-        ):
-            return None
-        recent_blocks = min(recent_blocks, block_budget)
-        block_scores = _boost_recent_block_scores(
-            block_scores,
-            recent_blocks=recent_blocks,
-            q_block_size=q_block_size,
-            k_block_size=k_block_size,
-            query_length=query_length,
-            key_length=key_length,
+    block_mask, block_token_mask = kernel(
+        inputs=[topk_indices.astype(mx.uint32)],
+        template=[
+            ("B", B),
+            ("L", L),
+            ("K", K),
+            ("TOPK", topk),
+            ("TOPK_ROWS", L_in),
+            ("Q_BLOCK", q_block_size),
+            ("K_BLOCK", k_block_size),
+            ("Q_BLOCKS", q_blocks),
+            ("K_BLOCKS", k_blocks),
+            ("CAUSAL", causal),
+            ("CAUSAL_PREFIX_INDICES", causal_prefix_indices),
+            ("PREFIX_ROWS", causal_prefix_rows),
+            ("COMPACT_PREFIX_TOPK", compact_prefix_topk),
+        ],
+        grid=(B * L * topk, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[
+            (B, 1, q_blocks, k_blocks),
+            (B, 1, L, k_blocks),
+        ],
+        output_dtypes=[mx.bool_, mx.uint32],
+        init_value=0,
+        stream=stream or mx.gpu,
+    )
+    return block_mask, block_token_mask
+
+
+def exact_block_token_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    topk_indices: mx.array,
+    scale: float,
+    *,
+    q_block_size: int = 32,
+    k_block_size: int = 8,
+    causal_prefix_indices: bool = False,
+    causal_prefix_rows: int = 0,
+    stream: Optional[mx.Stream] = None,
+) -> Optional[mx.array]:
+    """Run fork-default exact block-token SDPA when the native op is available."""
+
+    if (
+        not hasattr(glm_fast, "glm_dsa_exact_block_attention")
+        or q.ndim != 4
+        or k.ndim != 4
+        or v.ndim != 4
+        or topk_indices.ndim != 4
+        or q.shape[:2] != v.shape[:2]
+        or k.shape[:3] != v.shape[:3]
+        or q.shape[-1] != k.shape[-1]
+        or q.shape[-1] != v.shape[-1]
+        or q.shape[-1] != 256
+        or q.shape[2] <= 8
+    ):
+        return None
+
+    block_masks = topk_indices_to_block_masks(
+        topk_indices,
+        L=q.shape[2],
+        K=k.shape[2],
+        q_block_size=q_block_size,
+        k_block_size=k_block_size,
+        causal_prefix_indices=causal_prefix_indices,
+        causal_prefix_rows=causal_prefix_rows,
+        stream=stream,
+    )
+    if block_masks is None:
+        return None
+    block_mask, block_token_mask = block_masks
+    try:
+        return glm_fast.glm_dsa_exact_block_attention(
+            q,
+            k,
+            v,
+            block_mask,
+            block_token_mask,
+            scale,
+            causal=True,
+            stream=stream or mx.gpu,
         )
-    indices = mx.argpartition(block_scores, kth=-block_budget, axis=-1)[
-        ..., -block_budget:
-    ].astype(mx.uint32)
-    if sort_indices:
-        indices = mx.sort(indices, axis=-1)
-    return indices
+    except (AttributeError, RuntimeError, ValueError):
+        return None
 
 
 @lru_cache(maxsize=None)
@@ -203,15 +285,9 @@ def fused_index_score_reduce(
         return None
 
     B, H, L, K = head_scores.shape
-    short_k_threadgroup = int(
-        os.environ.get("MLX_LM_GLM_DSA_INDEX_REDUCE_THREADGROUP_SIZE", "512")
-    )
-    long_k_threshold = int(
-        os.environ.get("MLX_LM_GLM_DSA_INDEX_REDUCE_LONG_K_THRESHOLD", "32768")
-    )
-    long_k_threadgroup = int(
-        os.environ.get("MLX_LM_GLM_DSA_INDEX_REDUCE_LONG_K_THREADGROUP_SIZE", "256")
-    )
+    short_k_threadgroup = 512
+    long_k_threshold = 32768
+    long_k_threadgroup = 256
     threadgroup_size = (
         long_k_threadgroup if K > long_k_threshold else short_k_threadgroup
     )
@@ -266,7 +342,7 @@ def fused_indexer_scores(
         or queries.shape[1] != weights.shape[2]
         or queries.shape[3] != 128
         or keys.shape[3] != 128
-        or keys.shape[2] < int(os.environ.get("MLX_LM_GLM_DSA_INDEXER_MIN_K", "4096"))
+        or keys.shape[2] < 4096
         or queries.dtype != keys.dtype
         or queries.dtype != weights.dtype
     ):
@@ -276,6 +352,8 @@ def fused_indexer_scores(
     K = keys.shape[2]
     q_pad = (-L) % 64
     k_pad = (-K) % 64
+    if causal and causal_q_offset < 0 and (q_pad or k_pad):
+        causal_q_offset = K - L
 
     q = queries
     k = keys
@@ -301,211 +379,6 @@ def fused_indexer_scores(
     if q_pad or k_pad:
         scores = scores[:, :, :L, :K]
     return scores
-
-
-def fused_indexer_scores_high_histogram(
-    queries: mx.array,
-    keys: mx.array,
-    weights: mx.array,
-    *,
-    causal: bool = False,
-    unused_causal_prefix_topk: int = 0,
-    skip_causal_future_store: bool = False,
-    causal_q_offset: int = -1,
-    stream: Optional[mx.Stream] = None,
-) -> Optional[tuple[mx.array, mx.array]]:
-    """Compute exact indexer scores plus high-byte top-k histogram state."""
-
-    required = (
-        "dsa_indexer_scores_high_histogram",
-        "dsa_topk_indices_with_high_state",
-    )
-    if (
-        not all(hasattr(glm_fast, name) for name in required)
-        or queries.ndim != 4
-        or keys.ndim != 4
-        or weights.ndim != 3
-        or queries.shape[0] != keys.shape[0]
-        or queries.shape[0] != weights.shape[0]
-        or queries.shape[1] != 32
-        or keys.shape[1] != 1
-        or queries.shape[2] != weights.shape[1]
-        or queries.shape[1] != weights.shape[2]
-        or queries.shape[3] != 128
-        or keys.shape[3] != 128
-        or queries.shape[2] % 64 != 0
-        or keys.shape[2] % 64 != 0
-        or keys.shape[2] < int(os.environ.get("MLX_LM_GLM_DSA_INDEXER_MIN_K", "4096"))
-        or queries.dtype != keys.dtype
-        or queries.dtype != weights.dtype
-    ):
-        return None
-
-    scores, high_hist = glm_fast.dsa_indexer_scores_high_histogram(
-        queries,
-        keys,
-        weights,
-        causal=causal,
-        unused_causal_prefix_topk=unused_causal_prefix_topk,
-        skip_causal_future_store=skip_causal_future_store,
-        causal_q_offset=causal_q_offset,
-        stream=stream or mx.gpu,
-    )
-    return scores, high_hist
-
-
-def _dsa_histogram_threshold(hist: mx.array, topk: int) -> mx.array:
-    rev_cumsum = mx.cumsum(hist[..., ::-1], axis=-1)
-    target = mx.array(topk, dtype=mx.uint32)
-    rev_idx = mx.argmax((rev_cumsum >= target).astype(mx.uint32), axis=-1)
-    threshold_hi = (mx.array(255, dtype=mx.uint32) - rev_idx).astype(mx.uint32)
-
-    prev_idx = mx.maximum(
-        rev_idx.astype(mx.int32) - mx.array(1, dtype=mx.int32),
-        mx.array(0, dtype=mx.int32),
-    ).astype(mx.uint32)
-    prev = mx.take_along_axis(rev_cumsum, prev_idx[..., None], axis=-1)[..., 0]
-    greater = mx.where(
-        rev_idx > mx.array(0, dtype=mx.uint32),
-        prev,
-        mx.array(0, dtype=mx.uint32),
-    )
-    return mx.stack([threshold_hi, greater.astype(mx.uint32)], axis=-1)
-
-
-def _dsa_low_histogram_threshold(
-    high_state: mx.array, low_hist: mx.array, topk: int
-) -> mx.array:
-    greater_hi = high_state[..., 1]
-    target = mx.array(topk, dtype=mx.uint32) - greater_hi
-    rev_cumsum = mx.cumsum(low_hist[..., ::-1], axis=-1)
-    rev_idx = mx.argmax((rev_cumsum >= target[..., None]).astype(mx.uint32), axis=-1)
-    threshold_lo = (mx.array(255, dtype=mx.uint32) - rev_idx).astype(mx.uint32)
-
-    prev_idx = mx.maximum(
-        rev_idx.astype(mx.int32) - mx.array(1, dtype=mx.int32),
-        mx.array(0, dtype=mx.int32),
-    ).astype(mx.uint32)
-    prev = mx.take_along_axis(rev_cumsum, prev_idx[..., None], axis=-1)[..., 0]
-    greater_low = mx.where(
-        rev_idx > mx.array(0, dtype=mx.uint32),
-        prev,
-        mx.array(0, dtype=mx.uint32),
-    )
-    threshold_key = high_state[..., 0] * mx.array(256, dtype=mx.uint32) + threshold_lo
-    greater = greater_hi + greater_low.astype(mx.uint32)
-    return mx.stack(
-        [threshold_key.astype(mx.uint32), greater.astype(mx.uint32)], axis=-1
-    )
-
-
-def fused_indexer_topk_indices(
-    queries: mx.array,
-    keys: mx.array,
-    weights: mx.array,
-    topk: int,
-    *,
-    causal: bool = False,
-    causal_q_offset: int = -1,
-    stream: Optional[mx.Stream] = None,
-) -> Optional[mx.array]:
-    """Exact GLM DSA indexer top-k without a materialized score matrix.
-
-    The implementation mirrors the existing 16-bit radix top-k, but moves the
-    score production into Steel MMA passes: high-byte histogram, low-byte
-    histogram for the threshold bucket, then index emission. It preserves exact
-    top-k semantics up to normal equal-score tie freedom.
-    """
-
-    required = (
-        "dsa_indexer_score_histogram",
-        "dsa_indexer_score_low_histogram",
-        "dsa_indexer_topk_emit",
-    )
-    if (
-        not all(hasattr(glm_fast, name) for name in required)
-        or queries.ndim != 4
-        or keys.ndim != 4
-        or weights.ndim != 3
-        or queries.shape[0] != keys.shape[0]
-        or queries.shape[0] != weights.shape[0]
-        or queries.shape[1] != 32
-        or keys.shape[1] != 1
-        or queries.shape[2] != weights.shape[1]
-        or queries.shape[1] != weights.shape[2]
-        or queries.shape[3] != 128
-        or keys.shape[3] != 128
-        or queries.shape[2] % 64 != 0
-        or keys.shape[2] % 64 != 0
-        or keys.shape[2] < topk
-        or keys.shape[2] < int(os.environ.get("MLX_LM_GLM_DSA_INDEXER_MIN_K", "4096"))
-        or queries.dtype != keys.dtype
-        or queries.dtype != weights.dtype
-    ):
-        return None
-
-    s = stream or mx.gpu
-    high_hist = glm_fast.dsa_indexer_score_histogram(
-        queries,
-        keys,
-        weights,
-        causal=causal,
-        causal_q_offset=causal_q_offset,
-        stream=s,
-    )
-    high_state = _dsa_histogram_threshold(high_hist, topk)
-    low_hist = glm_fast.dsa_indexer_score_low_histogram(
-        queries,
-        keys,
-        weights,
-        high_state,
-        causal=causal,
-        causal_q_offset=causal_q_offset,
-        stream=s,
-    )
-    threshold = _dsa_low_histogram_threshold(high_state, low_hist, topk)
-    return glm_fast.dsa_indexer_topk_emit(
-        queries,
-        keys,
-        weights,
-        threshold,
-        topk,
-        causal=causal,
-        causal_q_offset=causal_q_offset,
-        stream=s,
-    )
-
-
-def fused_topk_indices_with_high_histogram(
-    scores: mx.array,
-    high_hist: mx.array,
-    topk: int,
-    *,
-    bucketed: bool = False,
-    causal_valid_prefix: bool = False,
-    stream: Optional[mx.Stream] = None,
-) -> Optional[mx.array]:
-    if (
-        not hasattr(glm_fast, "dsa_topk_indices_with_high_state")
-        or scores.ndim != 4
-        or scores.shape[1] != 1
-        or high_hist.ndim != 3
-        or high_hist.shape[0] != scores.shape[0]
-        or high_hist.shape[1] != scores.shape[2]
-        or high_hist.shape[2] != 256
-        or high_hist.dtype != mx.uint32
-    ):
-        return None
-    s = stream or mx.gpu
-    high_state = _dsa_histogram_threshold(high_hist, topk)
-    return glm_fast.dsa_topk_indices_with_high_state(
-        scores,
-        high_state,
-        topk,
-        bucketed=bucketed,
-        causal_valid_prefix=causal_valid_prefix,
-        stream=s,
-    )
 
 
 def sparse_mla_attention(
@@ -614,14 +487,7 @@ def q8_vup_flat(
 ) -> Optional[mx.array]:
     """Project GLM sparse MLA latent output directly to [B, L, H * 256]."""
 
-    env = os.environ.get("MLX_LM_GLM_DSA_Q8_VUP_FLAT", "auto").lower()
-    if env in {"0", "false", "off", "no"}:
-        return None
-    if env in {"auto", ""} and (
-        key_length is None or key_length < 32768 or key_length > 65536
-    ):
-        return None
-    if env not in {"1", "true", "on", "yes", "auto", ""}:
+    if key_length is None or key_length < 32768 or key_length > 65536:
         return None
 
     if (

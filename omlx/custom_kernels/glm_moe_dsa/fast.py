@@ -22,6 +22,7 @@ NATIVE_SYMBOLS = (
     "dsa_indexer_scores",
     "dsa_topk_indices",
     "glm_dsa_sparse_mla_attention",
+    "glm_dsa_exact_block_attention",
     "glm_dsa_q8_vup_flat",
     "glm_moe_weighted_sum",
 )
@@ -157,6 +158,40 @@ def glm_dsa_sparse_mla_attention(
         causal_prefix_indices=causal_prefix_indices,
         topk_length=topk_length,
         causal_prefix_rows=causal_prefix_rows,
+        stream=stream or mx.gpu,
+    )
+
+
+def glm_dsa_exact_block_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    block_mask: mx.array,
+    block_token_mask: mx.array,
+    scale: float,
+    causal: bool = True,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "glm_dsa_exact_block_attention"):
+        return _ext.glm_dsa_exact_block_attention(
+            q,
+            k,
+            v,
+            block_mask,
+            block_token_mask,
+            scale,
+            causal=causal,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.fast.glm_dsa_exact_block_attention(
+        q,
+        k,
+        v,
+        block_mask,
+        block_token_mask,
+        scale,
+        causal=causal,
         stream=stream or mx.gpu,
     )
 

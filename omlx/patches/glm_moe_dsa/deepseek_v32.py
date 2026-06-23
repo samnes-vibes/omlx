@@ -1,7 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
 import math
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -20,23 +19,13 @@ from mlx_lm.models.mla import MultiLinear
 from mlx_lm.models.rope_utils import initialize_rope
 from .kernels import fast as glm_fast
 from .sparse_mla import (
-    block_scores_to_indices,
-    fused_indexer_topk_indices,
-    fused_indexer_scores_high_histogram,
     fused_indexer_scores,
-    fused_topk_indices_with_high_histogram,
     fused_index_score_reduce,
-    scores_to_block_indices,
 )
-from .switch_layers import SwitchGLU, use_fused_gate_up_switch
+from .switch_layers import SwitchGLU
 
 
 def _use_load_fused_wk_weights_proj(args) -> bool:
-    env = os.environ.get("MLX_LM_GLM_DSA_LOAD_FUSED_WK_WEIGHTS_PROJ", "auto").lower()
-    if env in {"0", "false", "off", "no"}:
-        return False
-    if env in {"1", "true", "on", "yes"}:
-        return True
     if getattr(args, "model_type", None) != "glm_moe_dsa":
         return False
     quantization = getattr(args, "quantization", None)
@@ -61,53 +50,22 @@ def _use_load_fused_wk_weights_proj(args) -> bool:
 
 
 def _dequant_mla_proj_mode(args) -> str:
-    if getattr(args, "model_type", None) != "glm_moe_dsa":
-        return "0"
-    return os.environ.get("MLX_LM_GLM_DSA_DEQUANT_MLA_PROJ", "0").lower()
+    return "0"
 
 
 def _use_glm_moe_fused_gate_up(args) -> bool:
-    env = os.environ.get("MLX_LM_GLM_MOE_FUSED_GATE_UP", "auto").lower()
-    if env in {"0", "false", "off", "no"}:
-        return False
-    if env in {"1", "true", "on", "yes"}:
-        return True
-    return getattr(args, "model_type", None) == "glm_moe_dsa"
-
-
-def _use_glm_moe_swiglu_down(args) -> bool:
-    env = os.environ.get("MLX_LM_GLM_MOE_SWIGLU_DOWN", "auto").lower()
-    if env in {"0", "false", "off", "no"}:
-        return False
-    if env in {"1", "true", "on", "yes"}:
-        return getattr(args, "model_type", None) == "glm_moe_dsa"
     return getattr(args, "model_type", None) == "glm_moe_dsa"
 
 
 def _use_glm_shared_fused_gate_up(args) -> bool:
-    env = os.environ.get("MLX_LM_GLM_SHARED_FUSED_GATE_UP", "0").lower()
-    if env in {"0", "false", "off", "no"}:
-        return False
-    if env in {"1", "true", "on", "yes"}:
-        return getattr(args, "model_type", None) == "glm_moe_dsa"
     return False
 
 
 def _use_glm_moe_weighted_sum(args) -> bool:
-    env = os.environ.get("MLX_LM_GLM_MOE_WEIGHTED_SUM", "auto").lower()
-    if env in {"0", "false", "off", "no"}:
-        return False
-    if env in {"1", "true", "on", "yes"}:
-        return getattr(args, "model_type", None) == "glm_moe_dsa"
     return getattr(args, "model_type", None) == "glm_moe_dsa"
 
 
 def _use_glm_moe_inverse_scatter(args) -> bool:
-    env = os.environ.get("MLX_LM_GLM_MOE_INVERSE_SCATTER", "auto").lower()
-    if env in {"0", "false", "off", "no"}:
-        return False
-    if env in {"1", "true", "on", "yes"}:
-        return getattr(args, "model_type", None) == "glm_moe_dsa"
     return getattr(args, "model_type", None) == "glm_moe_dsa"
 
 
@@ -193,79 +151,7 @@ class Indexer(nn.Module):
             out = self.wk_weights_proj(x)
             return mx.split(out, [self.head_dim], axis=-1)
 
-        if os.environ.get("MLX_LM_GLM_DSA_FUSED_WK_WEIGHTS_PROJ", "0") != "1":
-            return None
-
-        wk = self.wk
-        weights_proj = self.weights_proj
-        wk_weight = getattr(wk, "weight", None)
-        wp_weight = getattr(weights_proj, "weight", None)
-        if wk_weight is None or wp_weight is None:
-            return None
-
-        wk_scales = getattr(wk, "scales", None)
-        wp_scales = getattr(weights_proj, "scales", None)
-        is_quantized = wk_scales is not None and wp_scales is not None
-        if is_quantized:
-            if (
-                getattr(wk, "group_size", None)
-                != getattr(weights_proj, "group_size", None)
-                or getattr(wk, "bits", None) != getattr(weights_proj, "bits", None)
-                or getattr(wk, "mode", None) != getattr(weights_proj, "mode", None)
-                or wk_weight.shape[1:] != wp_weight.shape[1:]
-                or wk_scales.shape[1:] != wp_scales.shape[1:]
-            ):
-                return None
-
-            wk_biases = getattr(wk, "biases", None)
-            wp_biases = getattr(weights_proj, "biases", None)
-            if (wk_biases is None) != (wp_biases is None):
-                return None
-
-            cache = self._wk_weights_proj_cache
-            if cache is None or cache[0] is not wk_weight or cache[1] is not wp_weight:
-                fused_weight = mx.concatenate([wk_weight, wp_weight], axis=0)
-                fused_scales = mx.concatenate([wk_scales, wp_scales], axis=0)
-                fused_biases = (
-                    None
-                    if wk_biases is None
-                    else mx.concatenate([wk_biases, wp_biases], axis=0)
-                )
-                cache = (
-                    wk_weight,
-                    wp_weight,
-                    fused_weight,
-                    fused_scales,
-                    fused_biases,
-                )
-                self._wk_weights_proj_cache = cache
-
-            out = mx.quantized_matmul(
-                x,
-                cache[2],
-                scales=cache[3],
-                biases=cache[4],
-                transpose=True,
-                group_size=wk.group_size,
-                bits=wk.bits,
-                mode=wk.mode,
-            )
-            return mx.split(out, [self.head_dim], axis=-1)
-
-        if (
-            wk_weight.shape[1:] != wp_weight.shape[1:]
-            or getattr(wk, "bias", None) is not None
-            or getattr(weights_proj, "bias", None) is not None
-        ):
-            return None
-
-        cache = self._wk_weights_proj_cache
-        if cache is None or cache[0] is not wk_weight or cache[1] is not wp_weight:
-            fused_weight = mx.concatenate([wk_weight, wp_weight], axis=0)
-            cache = (wk_weight, wp_weight, fused_weight)
-            self._wk_weights_proj_cache = cache
-        out = x @ cache[2].swapaxes(-1, -2)
-        return mx.split(out, [self.head_dim], axis=-1)
+        return None
 
     def __call__(
         self,
@@ -296,15 +182,9 @@ class Indexer(nn.Module):
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
             return None
-        use_fast_topk = os.environ.get(
-            "MLX_LM_GLM_DSA_FAST_TOPK", "1"
-        ) == "1" and hasattr(glm_fast, "dsa_topk_indices")
-        sort_exact_topk = os.environ.get("MLX_LM_GLM_DSA_SORT_EXACT_TOPK", "1") == "1"
-        bucketed_topk = (
-            use_fast_topk
-            and s > 1
-            and os.environ.get("MLX_LM_GLM_DSA_BUCKETED_TOPK", "1") == "1"
-        )
+        use_fast_topk = glm_fast.has("dsa_topk_indices")
+        sort_exact_topk = True
+        bucketed_topk = use_fast_topk and s > 1
         causal_valid_prefix_topk = False
         prefix_topk_rows = 0
 
@@ -330,7 +210,6 @@ class Indexer(nn.Module):
                 if (
                     indices is not None
                     and self.default_block_sparse_sdpa
-                    and os.environ.get("MLX_LM_GLM_DSA_COMPACT_PREFIX_TOPK", "1") == "1"
                 ):
                     return indices, None, prefix_rows
                 prefix = causal_prefix_topk(prefix_rows)
@@ -379,138 +258,12 @@ class Indexer(nn.Module):
                 scores = mx.where(mask, scores, -float("inf"))
             return select_topk(scores)
         weights_lh = weights_lh * self.weight_scale
-        fuse_causal_mask = (
-            mask is not None
-            and os.environ.get("MLX_LM_GLM_DSA_FUSED_INDEXER_CAUSAL", "1") == "1"
-        )
-        causal_valid_prefix_topk = (
-            fuse_causal_mask
-            and os.environ.get("MLX_LM_GLM_DSA_TOPK_CAUSAL_PREFIX_FASTPATH", "1") == "1"
-        )
-        default_block_sdpa = "1" if self.default_block_sparse_sdpa else "0"
-        use_block_sdpa = (
-            os.environ.get(
-                "MLX_LM_GLM_DSA_BLOCK_SPARSE_SDPA",
-                os.environ.get("MLX_LM_GLM_DSA_BLOCK_UNION_SDPA", default_block_sdpa),
-            )
-            == "1"
-        )
-        prefill_mode = os.environ.get("MLX_LM_GLM_DSA_PREFILL_MODE", "").lower()
-        default_exact_prefill = (
-            self.default_block_sparse_sdpa
-            and prefill_mode == ""
-            and os.environ.get("MLX_LM_GLM_DSA_EXACT_PREFILL_DEFAULT", "1") != "0"
-        )
-        mode_exact = prefill_mode in {"exact", "strict"} or default_exact_prefill
-        mode_high = prefill_mode in {"high", "quality", "recall"}
-        use_exact_block_token_sdpa = (
-            os.environ.get(
-                "MLX_LM_GLM_DSA_EXACT_BLOCK_TOKEN_SDPA",
-                "1" if mode_exact else "0",
-            )
-            == "1"
-        )
-        if mode_high:
-            default_block_budget = "128"
-        else:
-            default_block_budget = "16" if use_block_sdpa else "0"
-        block_budget = int(
-            os.environ.get(
-                "MLX_LM_GLM_DSA_BLOCK_SDPA_BUDGET",
-                os.environ.get("MLX_LM_GLM_DSA_BLOCK_BUDGET", default_block_budget),
-            )
-        )
-        if block_budget > 0:
-            min_block_budget = int(
-                os.environ.get("MLX_LM_GLM_DSA_BLOCK_MIN_BUDGET", "16")
-            )
-            if self.default_block_sparse_sdpa:
-                min_block_budget = max(min_block_budget, 16)
-            block_budget = max(block_budget, min_block_budget)
-        q_block_size = int(
-            os.environ.get(
-                "MLX_LM_GLM_DSA_BLOCK_SDPA_Q_BLOCK",
-                os.environ.get(
-                    "MLX_LM_GLM_DSA_BLOCK_BUDGET_Q_BLOCK",
-                    "32",
-                ),
-            )
-        )
-        k_block_size = int(
-            os.environ.get(
-                "MLX_LM_GLM_DSA_BLOCK_SDPA_K_BLOCK",
-                os.environ.get(
-                    "MLX_LM_GLM_DSA_BLOCK_BUDGET_K_BLOCK",
-                    "16",
-                ),
-            )
-        )
-        # Sorting improves locality for shorter contexts, but at long GLM
-        # prefill lengths the sort overhead slightly outweighs that benefit.
-        default_sort = (
-            "0" if self.default_block_sparse_sdpa and k.shape[2] >= 18432 else "1"
-        )
-        sort_block_indices = (
-            os.environ.get(
-                "MLX_LM_GLM_DSA_BLOCK_SDPA_SORT",
-                default_sort,
-            )
-            != "0"
-        )
-        recent_blocks = int(
-            os.environ.get(
-                "MLX_LM_GLM_DSA_BLOCK_SDPA_RECENT_BLOCKS",
-                os.environ.get("MLX_LM_GLM_DSA_BLOCK_RECENT_BLOCKS", "0"),
-            )
-        )
-        if (
-            block_budget > 0
-            and s > 1
-            and use_block_sdpa
-            and not use_exact_block_token_sdpa
-            and (mask is None or fuse_causal_mask)
-            and os.environ.get(
-                "MLX_LM_GLM_DSA_FUSED_BLOCK_INDEXER",
-                "0",
-            )
-            == "1"
-            and k.shape[2]
-            >= int(os.environ.get("MLX_LM_GLM_DSA_FUSED_BLOCK_INDEXER_MIN_K", "8192"))
-        ):
-            block_scores = glm_fast.dsa_indexer_block_scores(
-                q,
-                k,
-                weights_lh,
-                q_block_size=q_block_size,
-                k_block_size=k_block_size,
-                causal=fuse_causal_mask,
-            )
-            block_indices = block_scores_to_indices(
-                block_scores,
-                block_budget=block_budget,
-                recent_blocks=recent_blocks,
-                q_block_size=q_block_size,
-                k_block_size=k_block_size,
-                query_length=s,
-                key_length=k.shape[2],
-                sort_indices=sort_block_indices,
-            )
-            if block_indices is not None:
-                return None, block_indices
+        fuse_causal_mask = mask is not None
+        causal_valid_prefix_topk = fuse_causal_mask
 
         scores = None
-        score_high_hist = None
-        if (
-            s > 1
-            and (mask is None or fuse_causal_mask)
-            and os.environ.get("MLX_LM_GLM_DSA_CORE_INDEXER_SCORES", "1") == "1"
-        ):
-            scores_feed_block_path = (
-                block_budget > 0 and use_block_sdpa and not use_exact_block_token_sdpa
-            )
-            scores_feed_exact_topk = (
-                causal_valid_prefix_topk and not scores_feed_block_path
-            )
+        if s > 1 and (mask is None or fuse_causal_mask):
+            scores_feed_exact_topk = causal_valid_prefix_topk and use_fast_topk
             candidate_prefix_rows = 0
             if use_fast_topk and scores_feed_exact_topk:
                 candidate_prefix_rows = min(
@@ -527,28 +280,11 @@ class Indexer(nn.Module):
             default_chunk_mb = (
                 "128" if self.default_block_sparse_sdpa and k.shape[2] <= 65536 else "0"
             )
-            chunk_mb = int(
-                os.environ.get("MLX_LM_GLM_DSA_INDEXER_CHUNK_MB", default_chunk_mb)
-            )
+            chunk_mb = int(default_chunk_mb)
             chunked_topk = None
-            if (
-                os.environ.get("MLX_LM_GLM_DSA_FUSED_INDEXER_TOPK", "0") == "1"
-                and use_fast_topk
-                and not scores_feed_block_path
-            ):
-                fused_topk = fused_indexer_topk_indices(
-                    score_q,
-                    k,
-                    score_weights,
-                    self.index_topk,
-                    causal=fuse_causal_mask,
-                )
-                if fused_topk is not None:
-                    return finish_topk_indices(fused_topk, candidate_prefix_rows)
             if (
                 chunk_mb > 0
                 and use_fast_topk
-                and not scores_feed_block_path
                 and score_q.shape[2] > 64
             ):
                 bytes_per_score = 2
@@ -583,40 +319,19 @@ class Indexer(nn.Module):
                         chunked_topk = mx.concatenate(chunk_indices, axis=2)
                         return finish_topk_indices(chunked_topk, candidate_prefix_rows)
             if chunked_topk is None:
-                use_score_high_hist = (
-                    os.environ.get("MLX_LM_GLM_DSA_SCORE_HIGH_HIST", "0") == "1"
-                    and use_fast_topk
-                    and not scores_feed_block_path
-                    and (mask is None or scores_feed_exact_topk)
+                scores = fused_indexer_scores(
+                    score_q,
+                    k,
+                    score_weights,
+                    causal=fuse_causal_mask,
+                    skip_causal_future_store=scores_feed_exact_topk,
                 )
-                if use_score_high_hist:
-                    score_hist_pair = fused_indexer_scores_high_histogram(
-                        score_q,
-                        k,
-                        score_weights,
-                        causal=fuse_causal_mask,
-                        skip_causal_future_store=scores_feed_exact_topk,
-                    )
-                    if score_hist_pair is not None:
-                        scores, score_high_hist = score_hist_pair
-                if scores is None:
-                    scores = fused_indexer_scores(
-                        score_q,
-                        k,
-                        score_weights,
-                        causal=fuse_causal_mask,
-                        skip_causal_future_store=scores_feed_exact_topk,
-                    )
             if scores is not None:
                 prefix_topk_rows = candidate_prefix_rows
 
         weights = weights_lh.swapaxes(-1, -2)[..., None]
         head_scores = None
-        if (
-            scores is None
-            and s > 1
-            and os.environ.get("MLX_LM_GLM_DSA_FUSED_INDEXER_REDUCE", "1") == "1"
-        ):
+        if scores is None and s > 1:
             head_scores = q @ k.swapaxes(-1, -2)
             scores = fused_index_score_reduce(
                 head_scores,
@@ -632,32 +347,6 @@ class Indexer(nn.Module):
             fuse_causal_mask = False
         if mask is not None and not fuse_causal_mask:
             scores = mx.where(mask, scores, -float("inf"))
-        if (
-            block_budget > 0
-            and s > 1
-            and use_block_sdpa
-            and not use_exact_block_token_sdpa
-        ):
-            block_indices = scores_to_block_indices(
-                scores,
-                block_budget=block_budget,
-                q_block_size=q_block_size,
-                k_block_size=k_block_size,
-                recent_blocks=recent_blocks,
-                sort_indices=sort_block_indices,
-            )
-            if block_indices is not None:
-                return None, block_indices
-        if scores is not None and score_high_hist is not None:
-            high_hist_indices = fused_topk_indices_with_high_histogram(
-                scores,
-                score_high_hist,
-                self.index_topk,
-                bucketed=bucketed_topk,
-                causal_valid_prefix=causal_valid_prefix_topk,
-            )
-            if high_hist_indices is not None:
-                return finish_topk_indices(high_hist_indices, prefix_topk_rows)
         return select_topk(scores, prefix_topk_rows)
 
 
@@ -916,7 +605,6 @@ class DeepseekV32MoE(nn.Module):
             config.moe_intermediate_size,
             config.n_routed_experts,
             fused_gate_up=_use_glm_moe_fused_gate_up(config),
-            fused_swiglu_down=_use_glm_moe_swiglu_down(config),
             inverse_scatter=_use_glm_moe_inverse_scatter(config),
         )
 
@@ -1276,7 +964,7 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-            if _use_glm_moe_fused_gate_up(self.args) or use_fused_gate_up_switch():
+            if _use_glm_moe_fused_gate_up(self.args):
                 switch_prefix = f"{prefix}.mlp.switch_mlp"
                 for k in ["weight", "scales", "biases"]:
                     gate_key = f"{switch_prefix}.gate_proj.{k}"

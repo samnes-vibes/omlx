@@ -1,7 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import logging
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -21,27 +19,15 @@ from .deepseek_v32 import (
 )
 from .deepseek_v32 import Model as DSV32Model
 from .sparse_mla import (
+    exact_block_token_attention,
     q8_vup_flat,
     sparse_mla_attention,
 )
 
-logger = logging.getLogger(__name__)
-
-_SGLANG_GLM5_INDEX_TOPK_PATTERN = (
-    "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSS" "FSFFFSFSSSFSFFSFFSSS"
-)
-
 
 def _native_sparse_mla_default_min_k() -> str:
-    """Use native sparse MLA for all GLM-5.2 prefill chunks when available."""
-    return "0" if glm_fast.has("glm_dsa_sparse_mla_attention") else str(2**63 - 1)
-
-
-def _direct_sparse_mla_policy(default: str) -> tuple[bool, bool]:
-    env = os.environ.get("MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA", default).lower()
-    requested = env in {"1", "true", "on", "yes", "strict", "required", "require"}
-    required = env in {"strict", "required", "require"}
-    return requested, required
+    """Match the MLX fork's default sparse MLA threshold when native is present."""
+    return "11264" if glm_fast.has("glm_dsa_sparse_mla_attention") else str(2**63 - 1)
 
 
 def _parse_topk_state(topk_state):
@@ -148,76 +134,6 @@ class ModelArgs(BaseModelArgs):
         self.rope_theta = self.rope_parameters["rope_theta"]
 
         config_indexer_types = self.indexer_types
-        prefill_mode = os.environ.get("MLX_LM_GLM_DSA_PREFILL_MODE", "").lower()
-        indexcache_mode = os.environ.get("MLX_LM_GLM_DSA_INDEXCACHE", "").lower()
-        env_pattern = os.environ.get("MLX_LM_GLM_DSA_INDEX_TOPK_PATTERN")
-        indexcache_disabled = indexcache_mode in {
-            "0",
-            "false",
-            "off",
-            "none",
-            "disable",
-            "disabled",
-        }
-        indexcache_requested = prefill_mode in {
-            "sglang",
-            "indexcache",
-        } or indexcache_mode in {"1", "true", "sglang", "glm5", "glm-5"}
-        pattern_is_sglang = env_pattern is not None and env_pattern.strip().lower() in {
-            "sglang",
-            "glm5",
-            "glm-5",
-            "recommended",
-        }
-        indexcache_recall_risk_allowed = os.environ.get(
-            "MLX_LM_GLM_DSA_ALLOW_INDEXCACHE_RECALL_RISK", "0"
-        ).lower() in {"1", "true", "yes", "on"}
-        if (
-            not indexcache_disabled
-            and (indexcache_requested or pattern_is_sglang)
-            and not indexcache_recall_risk_allowed
-        ):
-            raise ValueError(
-                "SGLang-style GLM DSA IndexCache is disabled by default because "
-                "it failed a 32K multi-needle recall test on GLM-5.2-oQ4. "
-                "Set MLX_LM_GLM_DSA_ALLOW_INDEXCACHE_RECALL_RISK=1 to enable "
-                "this speed/recall-risk mode explicitly."
-            )
-        if not env_pattern and not indexcache_disabled and indexcache_requested:
-            env_pattern = "sglang"
-        if env_pattern:
-            env_pattern = env_pattern.strip()
-            if env_pattern.lower() in {"sglang", "glm5", "glm-5", "recommended"}:
-                env_pattern = _SGLANG_GLM5_INDEX_TOPK_PATTERN
-            self.index_topk_pattern = env_pattern
-            self.indexer_types = None
-        if "MLX_LM_GLM_DSA_INDEX_TOPK_FREQ" in os.environ:
-            self.index_topk_freq = int(os.environ["MLX_LM_GLM_DSA_INDEX_TOPK_FREQ"])
-            self.index_topk_pattern = None
-            if (
-                config_indexer_types is not None
-                and os.environ.get("MLX_LM_GLM_DSA_ALLOW_NEW_INDEXERS", "0") != "1"
-            ):
-                freq = max(self.index_topk_freq, 1)
-                full_count = 0
-                indexer_types = []
-                for layer_type in config_indexer_types:
-                    if layer_type == "full":
-                        indexer_types.append(
-                            "full" if full_count % freq == 0 else "shared"
-                        )
-                        full_count += 1
-                    else:
-                        indexer_types.append("shared")
-                self.indexer_types = indexer_types
-            else:
-                self.indexer_types = None
-        if "MLX_LM_GLM_DSA_INDEX_SKIP_TOPK_OFFSET" in os.environ:
-            self.index_skip_topk_offset = int(
-                os.environ["MLX_LM_GLM_DSA_INDEX_SKIP_TOPK_OFFSET"]
-            )
-            if self.index_topk_pattern is None:
-                self.indexer_types = None
 
         if self.indexer_types is None:
             if self.index_topk_pattern is not None:
@@ -232,10 +148,7 @@ class ModelArgs(BaseModelArgs):
                     pattern_types = [{"F": "full", "S": "shared"}[c] for c in pattern]
                 else:
                     pattern_types = list(pattern)
-                if (
-                    config_indexer_types is not None
-                    and os.environ.get("MLX_LM_GLM_DSA_ALLOW_NEW_INDEXERS", "0") != "1"
-                ):
+                if config_indexer_types is not None:
                     self.indexer_types = [
                         "full" if base == "full" and selected == "full" else "shared"
                         for base, selected in zip(config_indexer_types, pattern_types)
@@ -345,22 +258,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if self.indexer is not None and cache is not None and cache[0] is not None:
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
-        prefill_mode = os.environ.get("MLX_LM_GLM_DSA_PREFILL_MODE", "").lower()
-        default_exact_prefill = (
-            prefill_mode == ""
-            and os.environ.get("MLX_LM_GLM_DSA_EXACT_PREFILL_DEFAULT", "1") != "0"
-        )
-        exact_prefill = prefill_mode in {"exact", "strict"} or default_exact_prefill
         direct_sparse_mla_min_k = int(
-            os.environ.get(
-                "MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA_MIN_K",
-                _native_sparse_mla_default_min_k(),
-            )
-        )
-        direct_sparse_mla_default = (
-            "1"
-            if exact_prefill and kv_latent.shape[2] >= direct_sparse_mla_min_k
-            else "0"
+            _native_sparse_mla_default_min_k()
         )
         native_sparse_mla_shape = (
             topk_indices is not None
@@ -370,21 +269,14 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             and k_pe.shape[-1] == 64
             and topk_indices.shape[-1] == 2048
         )
-        direct_sparse_mla_requested, direct_sparse_mla_required = (
-            _direct_sparse_mla_policy(direct_sparse_mla_default)
-        )
         direct_sparse_mla_requested = (
-            native_sparse_mla_shape and L > 1 and direct_sparse_mla_requested
+            native_sparse_mla_shape
+            and L > 1
+            and kv_latent.shape[2] >= direct_sparse_mla_min_k
         )
         if direct_sparse_mla_requested:
-            fast_topk_indices = os.environ.get(
-                "MLX_LM_GLM_DSA_FAST_TOPK", "1"
-            ) == "1" and hasattr(glm_fast, "dsa_topk_indices")
-            causal_prefix_indices = (
-                fast_topk_indices
-                and os.environ.get("MLX_LM_GLM_DSA_TOPK_CAUSAL_PREFIX_FASTPATH", "1")
-                == "1"
-            )
+            fast_topk_indices = glm_fast.has("dsa_topk_indices")
+            causal_prefix_indices = fast_topk_indices
             q_latent = self.embed_q(q_nope)
             output = sparse_mla_attention(
                 q_latent,
@@ -406,15 +298,28 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
                 output = output_flat
                 return self.o_proj(output), topk_state
-            if direct_sparse_mla_required:
-                raise RuntimeError(
-                    "GLM direct sparse MLA was required, but no native kernel "
-                    "handled the current shape."
-                )
-            logger.debug(
-                "GLM direct sparse MLA was requested but no native kernel handled "
-                "the current shape; falling back to pure MLX SDPA."
+
+        if topk_indices is not None and L > 8:
+            k = self.embed_q(kv_latent, transpose=False)
+            k_pe_heads = mx.broadcast_to(k_pe, k.shape[:-1] + k_pe.shape[-1:])
+            q = mx.concatenate([q_nope, q_pe], axis=-1)
+            k = mx.concatenate([k, k_pe_heads], axis=-1)
+            v = self.unembed_out(kv_latent)
+            fast_topk_indices = glm_fast.has("dsa_topk_indices")
+            output = exact_block_token_attention(
+                q,
+                k,
+                v,
+                topk_indices,
+                self.scale,
+                q_block_size=32,
+                k_block_size=8,
+                causal_prefix_indices=fast_topk_indices,
+                causal_prefix_rows=topk_prefix_rows,
             )
+            if output is not None:
+                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return self.o_proj(output), topk_state
 
         mask = _apply_sparse_topk_mask(
             mask,

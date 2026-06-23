@@ -1,8 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
-import os
-from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,24 +9,8 @@ from mlx_lm.models.activations import swiglu
 from .kernels import fast as glm_fast
 
 
-def _env_flag(name, default="0"):
-    return os.environ.get(name, default).lower() in {"1", "true", "on", "yes"}
-
-
-def use_fused_gate_up_switch():
-    return _env_flag("MLX_LM_SWITCH_FUSED_GATE_UP")
-
-
-def use_fused_swiglu_down_switch():
-    return _env_flag("MLX_LM_GLM_MOE_SWIGLU_DOWN")
-
-
-def use_fused_swiglu_gate_up_switch():
-    return _env_flag("MLX_LM_GLM_MOE_SWIGLU_GATE_UP")
-
-
 def _inverse_permutation(order, inverse_scatter=False):
-    if inverse_scatter or _env_flag("MLX_LM_SWITCH_INVERSE_SCATTER"):
+    if inverse_scatter:
         return mx.put_along_axis(
             mx.zeros_like(order),
             order,
@@ -197,7 +179,6 @@ class SwitchGLU(nn.Module):
         activation=SwiGLU(),
         bias: bool = False,
         fused_gate_up: bool = False,
-        fused_swiglu_down: bool = False,
         inverse_scatter: bool = False,
     ):
         super().__init__()
@@ -206,9 +187,8 @@ class SwitchGLU(nn.Module):
         self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
-        self.fused_swiglu_down = fused_swiglu_down
         self.inverse_scatter = inverse_scatter
-        if fused_gate_up or use_fused_gate_up_switch():
+        if fused_gate_up:
             self.gate_up_proj = SwitchLinear(
                 input_dims, hidden_dims * 2, num_experts, bias=bias
             )
@@ -236,57 +216,13 @@ class SwitchGLU(nn.Module):
         if self.training:
             idx = mx.stop_gradient(idx)
         if hasattr(self, "gate_up_proj"):
-            if (
-                use_fused_swiglu_gate_up_switch()
-                and do_sort
-                and isinstance(self.activation, SwiGLU)
-                and isinstance(self.gate_up_proj, QuantizedSwitchLinear)
-                and isinstance(self.down_proj, QuantizedSwitchLinear)
-                and hasattr(glm_fast, "glm_moe_swiglu_gate_up")
-            ):
-                x = glm_fast.glm_moe_swiglu_gate_up(
-                    x,
-                    self.gate_up_proj["weight"],
-                    self.gate_up_proj["scales"],
-                    self.gate_up_proj.get("biases"),
-                    idx,
-                    self.gate_up_proj.group_size,
-                    self.gate_up_proj.bits,
-                    self.gate_up_proj.mode,
-                )
-                x = self.down_proj(
-                    x,
-                    idx,
-                    sorted_indices=do_sort,
-                )
-            else:
-                x_gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
-                if (
-                    (self.fused_swiglu_down or use_fused_swiglu_down_switch())
-                    and do_sort
-                    and isinstance(self.activation, SwiGLU)
-                    and isinstance(self.down_proj, QuantizedSwitchLinear)
-                    and hasattr(glm_fast, "glm_moe_swiglu_down")
-                ):
-                    x = glm_fast.glm_moe_swiglu_down(
-                        x_gate_up,
-                        self.down_proj["weight"],
-                        self.down_proj["scales"],
-                        self.down_proj.get("biases"),
-                        idx,
-                        self.down_proj.group_size,
-                        self.down_proj.bits,
-                        self.down_proj.mode,
-                    )
-                    if "bias" in self.down_proj:
-                        x = x + mx.expand_dims(self.down_proj["bias"][idx], -2)
-                else:
-                    x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
-                    x = self.down_proj(
-                        self.activation(x_up, x_gate),
-                        idx,
-                        sorted_indices=do_sort,
-                    )
+            x_gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            x = self.down_proj(
+                self.activation(x_up, x_gate),
+                idx,
+                sorted_indices=do_sort,
+            )
         else:
             x_up = self.up_proj(x, idx, sorted_indices=do_sort)
             x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)

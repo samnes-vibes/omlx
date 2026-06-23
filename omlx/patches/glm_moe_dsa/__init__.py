@@ -31,6 +31,7 @@ def _missing_fast_symbols() -> list[str]:
         "dsa_indexer_scores",
         "dsa_topk_indices",
         "glm_dsa_sparse_mla_attention",
+        "glm_dsa_exact_block_attention",
         "glm_dsa_q8_vup_flat",
         "glm_moe_weighted_sum",
     )

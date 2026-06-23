@@ -221,31 +221,9 @@ class GlmMoeWeightedSumPrimitive : public Primitive {
     const int tokens = scores.size() / topk;
     const int D = x_sorted.shape(-1);
 
-    bool use_tiled = true;
-    if (const char* tiled_env = std::getenv("MLX_LM_GLM_MOE_WEIGHTED_SUM_TILED")) {
-      use_tiled = std::string(tiled_env) != "0";
-    }
-    int tiled_threads = 256;
-    if (const char* tiled_threads_env =
-            std::getenv("MLX_LM_GLM_MOE_WEIGHTED_SUM_TILED_THREADS")) {
-      tiled_threads = std::atoi(tiled_threads_env);
-    }
-    if (tiled_threads != 128 && tiled_threads != 256 && tiled_threads != 512) {
-      tiled_threads = 256;
-    }
-    int vec = 4;
-    if (const char* legacy_vec4_env =
-            std::getenv("MLX_LM_GLM_MOE_WEIGHTED_SUM_VEC4")) {
-      if (std::string(legacy_vec4_env) == "0") {
-        vec = 1;
-      }
-    }
-    if (const char* vec_env = std::getenv("MLX_LM_GLM_MOE_WEIGHTED_SUM_VEC")) {
-      vec = std::atoi(vec_env);
-    }
-    if (!((vec == 4 || vec == 8 || vec == 16) && D % vec == 0)) {
-      vec = 1;
-    }
+    const bool use_tiled = true;
+    const int tiled_threads = 256;
+    const int vec = (D % 4 == 0) ? 4 : 1;
 
     std::string kname;
     if (use_tiled) {
