@@ -1612,9 +1612,23 @@ class VLMBatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         engine = self._engine
 
+        for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
+            cancel_event.set()
+
+        if engine:
+            await engine.stop()
+
+        if self._vision_cache is not None:
+            try:
+                self._vision_cache.close()
+            except Exception:
+                logger.warning("Error closing vision feature cache", exc_info=True)
+            self._vision_cache = None
+
         # Drop wrapper-side references before EngineCore.close() performs its
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
-        # model weights alive until after the reclaim pass has already run.
+        # model weights or cached feature arrays alive until after the reclaim
+        # pass has already run.
         self._engine = None
         self._vlm_model = None
         self._processor = None
@@ -1624,17 +1638,11 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_family = None
 
         if engine:
-            await engine.stop()
             if hasattr(engine, "engine") and engine.engine is not None:
                 try:
                     engine.engine.close()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
-        if self._vision_cache is not None:
-            self._vision_cache.close()
-            self._vision_cache = None
-        for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
-            cancel_event.set()
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
         self._loaded = False
