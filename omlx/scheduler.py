@@ -4727,12 +4727,13 @@ class Scheduler:
         if think_start_id is not None:
             think_start_ids = [think_start_id]
         else:
-            think_start_text = self._get_output_parser_thinking_start_text() or "<think>"
+            think_start_text = (
+                self._get_output_parser_thinking_start_text() or "<think>"
+            )
             try:
                 token_id = self.tokenizer.convert_tokens_to_ids(think_start_text)
-                if (
-                    isinstance(token_id, int)
-                    and token_id != getattr(self.tokenizer, "unk_token_id", None)
+                if isinstance(token_id, int) and token_id != getattr(
+                    self.tokenizer, "unk_token_id", None
                 ):
                     think_start_ids = [token_id]
             except (AttributeError, KeyError, TypeError):
@@ -5457,12 +5458,49 @@ class Scheduler:
                                 "CacheList"
                             )
                             state_dict = handler.extract_state(layer_cache)
+                            sub_states = list(state_dict.get("sub_states", []))
+                            sub_class_names = list(
+                                state_dict.get("sub_class_names", [])
+                            )
+                            sub_meta_states = list(
+                                state_dict.get("sub_meta_states", [])
+                            )
+
+                            sub_caches = getattr(layer_cache, "caches", ())
+                            for sub_idx, sub_cache in enumerate(sub_caches):
+                                if sub_idx >= len(sub_states):
+                                    break
+
+                                sub_class_name = type(sub_cache).__name__
+                                if sub_class_name in (
+                                    "RotatingKVCache",
+                                    "BatchRotatingKVCache",
+                                    "PrefillReadyRotatingKVCache",
+                                ):
+                                    normalized_state, normalized_meta = (
+                                        self._normalize_rotating_snapshot_state(
+                                            sub_cache,
+                                            sub_states[sub_idx],
+                                            (
+                                                sub_meta_states[sub_idx]
+                                                if sub_idx < len(sub_meta_states)
+                                                else getattr(
+                                                    sub_cache, "meta_state", ()
+                                                )
+                                            ),
+                                            layer_idx=layer_idx,
+                                        )
+                                    )
+                                    sub_states[sub_idx] = normalized_state
+                                    if sub_idx < len(sub_meta_states):
+                                        sub_meta_states[sub_idx] = normalized_meta
+
                             extracted.append(
                                 {
-                                    "state": state_dict.get("sub_states", []),
+                                    "state": sub_states,
                                     "meta_state": (
-                                        state_dict.get("sub_class_names", []),
-                                        state_dict.get("sub_meta_states", []),
+                                        sub_class_names,
+                                        sub_meta_states,
                                     ),
                                     "class_name": "CacheList",
                                     "cache_type": "CacheList",
@@ -5513,6 +5551,8 @@ class Scheduler:
                     is_rotating_cache = class_name in (
                         "RotatingKVCache",
                         "BatchRotatingKVCache",
+                        "PrefillReadyRotatingKVCache",
+                        "BufferedRotatingKVCache",
                     )
                     if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
                         is_rotating_cache = (
@@ -5719,8 +5759,7 @@ class Scheduler:
             return None
         if not (
             best_common >= self._CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS
-            or best_common / len(prompt)
-            >= self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO
+            or best_common / len(prompt) >= self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO
         ):
             return None
 
@@ -6628,10 +6667,7 @@ class Scheduler:
         prompt_tokens = request.prompt_token_ids or []
         if not cache_list or block_table is None or not block_table.block_ids:
             return False
-        if (
-            block_table.num_tokens <= 0
-            or block_table.num_tokens >= len(prompt_tokens)
-        ):
+        if block_table.num_tokens <= 0 or block_table.num_tokens >= len(prompt_tokens):
             return False
 
         minimax_m3_names = frozenset({"MiniMaxM3KVCache"})
@@ -7541,9 +7577,7 @@ class Scheduler:
                         rejected_outputs.append(stalled)
                 else:
                     if self.waiting:
-                        self._clear_memory_admission_blocker(
-                            self.waiting[0].request_id
-                        )
+                        self._clear_memory_admission_blocker(self.waiting[0].request_id)
                     stalled = self._store_cache_admission_stall_output(
                         "store_cache_backpressure",
                         gate_in_flight=gate.in_flight,
@@ -8352,8 +8386,7 @@ class Scheduler:
                         prefix_text = think_tag + "\n"
                     else:
                         prefix_text = (
-                            self._get_output_parser_thinking_start_output_text()
-                            or ""
+                            self._get_output_parser_thinking_start_output_text() or ""
                         )
                     if prefix_text:
                         new_text = prefix_text + new_text

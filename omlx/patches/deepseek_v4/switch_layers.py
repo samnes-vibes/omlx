@@ -14,7 +14,6 @@ import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
-
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
@@ -268,7 +267,7 @@ class SwitchLinear(nn.Module):
     def num_experts(self):
         return self.weight.shape[0]
 
-    def __call__(self, x, indices, sorted_indices=False):
+    def __call__(self, x, indices, sorted_indices=False, block_plan=None):
         x = mx.gather_mm(
             x,
             self["weight"].swapaxes(-1, -2),
@@ -393,9 +392,7 @@ class SwitchGLU(nn.Module):
                 x_up = x_pair[0]
                 x_gate = x_pair[1]
         else:
-            x_up = self.up_proj(
-                x, idx, sorted_indices=do_sort, block_plan=block_plan
-            )
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort, block_plan=block_plan)
             x_gate = self.gate_proj(
                 x, idx, sorted_indices=do_sort, block_plan=block_plan
             )
@@ -407,16 +404,10 @@ class SwitchGLU(nn.Module):
         )
 
         if do_sort:
-            if (
-                scores is not None
-                and scores.shape[-1] in (6, 8)
-                and glm_fast.has_symbol("glm_moe_weighted_sum")
-            ):
-                return glm_fast.glm_moe_weighted_sum(
-                    x,
-                    inv_order.astype(mx.uint32),
-                    scores,
-                ).astype(original_dtype)
+            # Keep the reference scatter path for DeepSeek V4. The fused
+            # weighted-sum kernel changes long-context prefix snapshot state
+            # enough to make greedy cache-hit decoding diverge from fresh
+            # prefill, while the MXFP4 expert GEMM path remains stable.
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         x = x.squeeze(-2)

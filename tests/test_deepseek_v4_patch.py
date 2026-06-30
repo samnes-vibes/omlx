@@ -784,6 +784,65 @@ class TestCacheMaterialization:
         assert loop_pos < materialize_pos < pipeline_send_pos
 
 
+class TestDeepseekV4SwitchGLU:
+    """DeepSeek-V4 SwitchGLU execution guards."""
+
+    def test_skips_fused_weighted_sum_for_cache_stability(
+        self, applied_patch, monkeypatch
+    ):
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "has_symbol",
+            lambda name: name == "glm_moe_weighted_sum",
+        )
+
+        def fail_weighted_sum(*args, **kwargs):
+            raise AssertionError("DeepSeek V4 must not use fused weighted sum")
+
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "glm_moe_weighted_sum",
+            fail_weighted_sum,
+            raising=False,
+        )
+
+        mx.random.seed(11)
+        layer = switch_layers.SwitchGLU(
+            input_dims=16,
+            hidden_dims=32,
+            num_experts=4,
+            bias=False,
+        )
+        x = mx.random.normal((1, 8, 16), dtype=mx.float32)
+        indices = mx.array(
+            [
+                [
+                    [0, 1, 2, 3, 0, 1, 2, 3],
+                    [1, 2, 3, 0, 1, 2, 3, 0],
+                    [2, 3, 0, 1, 2, 3, 0, 1],
+                    [3, 0, 1, 2, 3, 0, 1, 2],
+                    [0, 2, 1, 3, 0, 2, 1, 3],
+                    [1, 3, 2, 0, 1, 3, 2, 0],
+                    [2, 0, 3, 1, 2, 0, 3, 1],
+                    [3, 1, 0, 2, 3, 1, 0, 2],
+                ]
+            ],
+            dtype=mx.int32,
+        )
+        scores = mx.softmax(
+            mx.random.normal((1, 8, 8), dtype=mx.float32),
+            axis=-1,
+        )
+
+        y = layer(x, indices, scores=scores)
+        mx.eval(y)
+
+        assert y.shape == (1, 8, 8, 16)
+
+
 class TestPreLoadDispatch:
     """maybe_apply_pre_load_patches gates correctly on config.json model_type."""
 
