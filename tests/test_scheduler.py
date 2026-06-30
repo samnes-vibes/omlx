@@ -75,7 +75,7 @@ class TestSchedulerConfig:
         assert config.policy == SchedulingPolicy.FCFS
         assert config.completion_batch_size == 32
         assert config.embedding_batch_size == 32
-        assert config.prefill_step_size == 2048
+        assert config.prefill_step_size == 512
         assert config.paged_cache_block_size == 256
         assert config.max_cache_blocks is None
         assert config.initial_cache_blocks == 256
