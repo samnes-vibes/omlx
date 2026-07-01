@@ -11,6 +11,7 @@ import pytest
 
 try:
     import mlx.core as mx
+    import mlx.nn as nn
 
     HAS_MLX = True
 except ImportError:
@@ -34,6 +35,9 @@ from omlx.oq import (
     _forward_layer,
     _forward_layer_result,
     _get_predicate_bits,
+    _ImatrixCaptureWrapper,
+    _imatrix_expert_coverage_stats,
+    _imatrix_expert_coverage_sufficient,
     _is_audio_tensor,
     _is_moe_router,
     _is_vision_tensor,
@@ -48,6 +52,8 @@ from omlx.oq import (
     _should_quantize_tensor,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
+    OQImatrixCollector,
+    OQImatrixEntry,
     estimate_bpw_and_size,
     estimate_memory,
     make_predicate,
@@ -513,6 +519,12 @@ class TestResolveOutputName:
     def test_strip_existing_enhanced_suffix(self):
         assert (
             resolve_output_name("Qwen3.5-122B-A10B-oQ4e", 2) == "Qwen3.5-122B-A10B-oQ2"
+        )
+
+    def test_enhanced_appends_e_suffix(self):
+        assert (
+            resolve_output_name("Qwen3.5-122B-A10B", 4, enhanced=True)
+            == "Qwen3.5-122B-A10B-oQ4e"
         )
 
     def test_all_levels(self):
@@ -1477,6 +1489,216 @@ class TestQuantizeChunked:
         qw, scales, biases = _quantize_chunked(w, group_size=64, bits=4, mode="affine")
         assert qw.shape[0] == 16
         assert scales.shape[0] == 16
+
+    def test_uniform_importance_matches_mx_quantize(self):
+        w = mx.random.normal((8, 64)).astype(mx.float16)
+        mx.eval(w)
+        qw_ref, scales_ref, *rest_ref = mx.quantize(
+            w, group_size=64, bits=4, mode="affine"
+        )
+        biases_ref = rest_ref[0] if rest_ref else None
+
+        qw, scales, biases = _quantize_chunked(
+            w,
+            group_size=64,
+            bits=4,
+            mode="affine",
+            importance=mx.ones((64,), dtype=mx.float32),
+        )
+
+        np.testing.assert_array_equal(np.array(qw), np.array(qw_ref))
+        np.testing.assert_array_equal(np.array(scales), np.array(scales_ref))
+        np.testing.assert_array_equal(np.array(biases), np.array(biases_ref))
+
+    def test_weighted_importance_reduces_weighted_error(self):
+        vals = np.array(
+            [
+                8.0,
+                -0.9835515,
+                -1.0129286,
+                -0.9208264,
+                -0.933982,
+                -0.96833235,
+                -1.1101755,
+                -0.99739856,
+                -0.96581566,
+                -0.9498019,
+                -0.62327445,
+                0.04132598,
+            ]
+            + [0.0] * 52,
+            dtype=np.float32,
+        )
+        w = mx.array(vals.reshape(1, 64), dtype=mx.float16)
+        importance = np.full((64,), 0.1, dtype=np.float32)
+        importance[1:10] = 100.0
+        imp = mx.array(importance)
+
+        qw_ref, scales_ref, biases_ref = mx.quantize(
+            w, group_size=64, bits=2, mode="affine"
+        )
+        y_ref = mx.dequantize(
+            qw_ref,
+            scales_ref,
+            biases_ref,
+            group_size=64,
+            bits=2,
+            mode="affine",
+        )
+
+        qw, scales, biases = _quantize_chunked(
+            w,
+            group_size=64,
+            bits=2,
+            mode="affine",
+            importance=imp,
+        )
+        y_weighted = mx.dequantize(
+            qw,
+            scales,
+            biases,
+            group_size=64,
+            bits=2,
+            mode="affine",
+        )
+        ref_err = mx.sum(((w - y_ref) ** 2) * imp)
+        weighted_err = mx.sum(((w - y_weighted) ** 2) * imp)
+        mx.eval(ref_err, weighted_err)
+        assert weighted_err.item() < ref_err.item()
+
+    def test_weighted_3d_expert_importance_chunked(self, monkeypatch):
+        monkeypatch.setattr("omlx.oq._QUANTIZE_CHUNK_BYTES", 128)
+        w = mx.random.normal((4, 2, 64)).astype(mx.float16)
+        importance = mx.arange(4 * 64, dtype=mx.float32).reshape(4, 64) + 1.0
+        mx.eval(w, importance)
+
+        qw, scales, biases = _quantize_chunked(
+            w,
+            group_size=64,
+            bits=4,
+            mode="affine",
+            importance=importance,
+        )
+
+        assert qw.shape == (4, 2, 8)
+        assert scales.shape == (4, 2, 1)
+        assert biases.shape == (4, 2, 1)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestOQImatrixCollector:
+    def test_capture_wrapper_delegates_without_init_recursion(self):
+        module = nn.Linear(4, 3, bias=False)
+        collector = OQImatrixCollector()
+
+        wrapper = _ImatrixCaptureWrapper(module, "linear", collector)
+        y = wrapper(mx.ones((2, 4)))
+        mx.eval(y)
+
+        assert wrapper.weight is module.weight
+        assert "linear" in collector.entries
+        assert collector.entries["linear"].counts[0] == 2
+
+    def test_switch_topk_capture_accumulates_per_expert(self):
+        class SwitchModule:
+            weight = mx.zeros((3, 2, 4))
+
+        collector = OQImatrixCollector()
+        x = mx.array(
+            [
+                [1.0, 2.0, 3.0, 4.0],
+                [5.0, 6.0, 7.0, 8.0],
+            ],
+            dtype=mx.float32,
+        )
+        indices = mx.array([[0, 1], [1, 2]], dtype=mx.int32)
+
+        collector.collect_switch("switch", SwitchModule(), x, indices)
+
+        entry = collector.entries["switch"]
+        expected_sq = np.asarray(
+            [
+                [1.0, 4.0, 9.0, 16.0],
+                [26.0, 40.0, 58.0, 80.0],
+                [25.0, 36.0, 49.0, 64.0],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_array_equal(entry.counts, np.array([1, 2, 1]))
+        np.testing.assert_allclose(entry.in_sum2, expected_sq)
+
+    def test_expert_coverage_stats_gate_adaptive_collection(self):
+        insufficient = {
+            "experts": OQImatrixEntry(
+                in_sum2=np.zeros((4, 8), dtype=np.float32),
+                counts=np.array([0, 16, 32, 48], dtype=np.int64),
+            )
+        }
+        stats = _imatrix_expert_coverage_stats(insufficient)
+
+        assert stats["has_expert_counts"] is True
+        assert stats["zero_count_experts"] == 1
+        assert _imatrix_expert_coverage_sufficient(stats) is False
+
+        sufficient = {
+            "experts": OQImatrixEntry(
+                in_sum2=np.zeros((4, 8), dtype=np.float32),
+                counts=np.array([16, 16, 32, 48], dtype=np.int64),
+            )
+        }
+        stats = _imatrix_expert_coverage_stats(sufficient)
+
+        assert stats["zero_count_experts"] == 0
+        assert stats["p05_count"] >= 16
+        assert _imatrix_expert_coverage_sufficient(stats) is True
+
+
+class TestOQECalibrationData:
+    @staticmethod
+    def _rough_est_tokens(text: str) -> int:
+        total = 0.0
+        for ch in text:
+            o = ord(ch)
+            if 0x3040 <= o <= 0x30FF or 0x3400 <= o <= 0x9FFF or 0xAC00 <= o <= 0xD7AF:
+                total += 1 / 1.3
+            elif ch.isspace():
+                continue
+            elif o < 128:
+                total += 1 / 4
+            else:
+                total += 1 / 2
+        return int(total)
+
+    def test_oqe_calibration_json_is_balanced_and_multilingual(self):
+        p = Path(__file__).parent.parent / "omlx" / "oqe_calibration_data.json"
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+
+        required = {
+            "tool_calling",
+            "chat",
+            "mixed",
+            "reasoning",
+            "code",
+            "en",
+            "ko",
+            "zh",
+            "ja",
+            "bartowski",
+        }
+        assert required.issubset(data.keys())
+
+        tokens = {
+            key: sum(self._rough_est_tokens(text) for text in data[key])
+            for key in required
+        }
+        total = sum(tokens.values())
+        shares = {key: value / total for key, value in tokens.items()}
+
+        multilingual_share = sum(shares[key] for key in ("en", "ko", "zh", "ja"))
+        assert multilingual_share >= 0.25
+        assert shares["tool_calling"] <= 0.18
+        assert max(shares.values()) <= 0.18
 
 
 # =============================================================================

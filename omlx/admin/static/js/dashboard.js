@@ -404,6 +404,12 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqEnhanced: false,
+            oqeReuseImatrixCache: true,
+            oqeImatrixCachePath: '',
+            oqeCalibrationSamples: 128,
+            oqeSequenceLength: 512,
+            oqeStrictImatrix: false,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -4263,24 +4269,35 @@
                 this.oqSuccess = '';
                 this.oqStarting = true;
                 try {
+                    const payload = {
+                        model_path: this.oqSelectedModelPath,
+                        oq_level: this.oqLevel,
+                        group_size: 64,
+                        sensitivity_model_path: this.oqSensitivityModelPath,
+                        text_only: this.oqTextOnly,
+                        dtype: this.oqDtype,
+                        preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
+                    };
+                    if (this.oqEnhanced) {
+                        const imatrixSamples = parseInt(this.oqeCalibrationSamples, 10);
+                        const imatrixSeqLength = parseInt(this.oqeSequenceLength, 10);
+                        payload.enhanced = true;
+                        payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
+                        payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
+                        payload.imatrix_strict = this.oqeStrictImatrix;
+                        payload.imatrix_num_samples = Number.isFinite(imatrixSamples) ? imatrixSamples : 128;
+                        payload.imatrix_seq_length = Number.isFinite(imatrixSeqLength) ? imatrixSeqLength : 512;
+                    }
                     const response = await fetch('/admin/api/oq/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model_path: this.oqSelectedModelPath,
-                            oq_level: this.oqLevel,
-                            group_size: 64,
-                            sensitivity_model_path: this.oqSensitivityModelPath,
-                            text_only: this.oqTextOnly,
-                            dtype: this.oqDtype,
-                            preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
-                        }),
+                        body: JSON.stringify(payload),
                     });
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}`;
+                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}${this.oqEnhanced ? 'e' : ''}`;
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
@@ -4350,7 +4367,8 @@
 
             formatOQProgress(task) {
                 const pct = Math.round(task.progress || 0);
-                return `${pct}% · ${task.phase || task.status}`;
+                const label = task.progress_detail || task.phase || task.status;
+                return `${pct}% · ${label}`;
             },
 
             formatOQElapsed(task) {
