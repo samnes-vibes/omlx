@@ -1502,141 +1502,172 @@
                             </div>
                         </template>
                         <!-- About oQ Quantization -->
-                        <div class="bg-neutral-50 rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="px-6 py-4 border-b border-neutral-200">
-                                <h4 class="text-sm font-semibold text-neutral-700">About oQ Quantization</h4>
-                            </div>
-                            <div class="px-6 py-5 text-sm text-neutral-500 leading-relaxed space-y-5">
-                                <!-- Title -->
-                                <h4 class="text-lg font-bold text-neutral-800">oQ: oMLX Universal Dynamic Quantization</h4>
-
-                                <!-- Philosophy -->
-                                <blockquote class="border-l-2 border-neutral-300 pl-4 text-neutral-600 italic font-semibold">
-                                    <p>Quantization should not be exclusive to any particular inference server.</p>
-                                    <p class="mt-1">oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app
-                                    that supports MLX safetensors format.</p>
-                                    <p class="mt-1">No custom loader required.</p>
-                                </blockquote>
-
-                                <!-- Intro -->
+                        <div x-data="{ oqAboutOpen: false }"
+                             class="bg-neutral-50 rounded-2xl border border-neutral-200 overflow-hidden">
+                            <button type="button"
+                                    @click="oqAboutOpen = !oqAboutOpen"
+                                    class="w-full px-6 py-4 flex items-center justify-between gap-4 text-left hover:bg-neutral-100 transition-colors"
+                                    :aria-expanded="oqAboutOpen.toString()"
+                                    aria-controls="oq-about-panel">
                                 <div>
-                                    <p class="mt-1.5 text-sm text-neutral-500">
-                                        oQ measures each layer's quantization sensitivity through calibration (relative MSE vs float16)
-                                        and builds a byte-budgeted mixed-precision plan that allocates bits where the data says they
-                                        matter most. Built-in calibration data (600 samples across code, multilingual, reasoning, and
-                                        tool calling). Every model gets a unique bit allocation tuned to its architecture.
+                                    <h4 class="text-sm font-semibold text-neutral-700">About oQ Quantization</h4>
+                                    <p class="mt-1 text-xs text-neutral-500">
+                                        Compare standard oQ with oQe imatrix and how enhanced quantization works.
+                                    </p>
+                                </div>
+                                <i data-lucide="chevron-down"
+                                   class="w-4 h-4 text-neutral-400 shrink-0 transition-transform"
+                                   :class="oqAboutOpen ? 'rotate-180' : ''"></i>
+                            </button>
+                            <div id="oq-about-panel"
+                                 x-show="oqAboutOpen"
+                                 x-cloak
+                                 x-transition
+                                 class="px-6 py-5 border-t border-neutral-200 text-sm text-neutral-500 leading-relaxed space-y-6">
+                                <div>
+                                    <h4 class="text-lg font-bold text-neutral-800">oQ: oMLX Universal Dynamic Quantization</h4>
+                                    <blockquote class="mt-3 border-l-2 border-neutral-300 pl-4 text-neutral-600 italic font-semibold">
+                                        <p>Quantization should not be exclusive to any particular inference server.</p>
+                                        <p class="mt-1">
+                                            oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm,
+                                            LM Studio, and any app that supports MLX safetensors format.
+                                        </p>
+                                        <p class="mt-1">No custom loader required.</p>
+                                    </blockquote>
+                                </div>
+
+                                <div>
+                                    <h5 class="text-base font-bold text-neutral-700">oQ and oQe: MLX-native mixed precision</h5>
+                                    <p class="mt-2">
+                                        The quantizer streams tensors from safetensors, measures layer sensitivity, and writes a
+                                        byte-budgeted mixed-precision checkpoint. Standard oQ focuses on layer-level sensitivity
+                                        and model-aware protection rules. oQe keeps that same oQ plan and adds imatrix-weighted
+                                        affine quantization.
                                     </p>
                                 </div>
 
-                                <!-- Key features -->
                                 <div>
-                                    <h5 class="text-base font-bold text-neutral-700">Key features</h5>
+                                    <h5 class="text-base font-bold text-neutral-700">What standard oQ does</h5>
                                     <div class="mt-3 space-y-3">
                                         <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Data-driven sensitivity</strong> <span class="text-neutral-500">Per-layer relative MSE measured against float16. Layers are ranked by quantization impact; the top 25% are marked as sensitive and receive priority in bit allocation.</span></div>
+                                            <i data-lucide="activity" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
+                                            <div>
+                                                <strong class="text-neutral-700">Layer sensitivity</strong>
+                                                <span class="text-neutral-500">
+                                                    is measured with calibration prompts by comparing quantized-layer output error
+                                                    against the float baseline.
+                                                </span>
+                                            </div>
                                         </div>
                                         <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Budget-constrained allocation</strong> <span class="text-neutral-500">4-phase greedy plan within a hard bpw cap. Consensus tensors (lm_head, embeddings) get 8-bit first. Then attention and shared-expert layers get a protection floor. Remaining budget goes to the highest-sensitivity tensors. Routed experts (93-98% of MoE params) stay at base bits so the budget concentrates on the layers that actually move output quality.</span></div>
+                                            <i data-lucide="sliders-horizontal" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
+                                            <div>
+                                                <strong class="text-neutral-700">Mixed precision</strong>
+                                                <span class="text-neutral-500">
+                                                    allocates higher bits to sensitive layers and protected tensors while keeping
+                                                    the target bits-per-weight budget under a hard cap.
+                                                </span>
+                                            </div>
                                         </div>
                                         <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M2 12h5l3-9 4 18 3-9h5"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Model-aware quantization</strong> <span class="text-neutral-500">MoE: router fp16, routed experts at base, shared experts protected. VLM: vision encoder fp16. SSM: state tensors fp32. 512+ expert models get larger group size automatically.</span></div>
+                                            <i data-lucide="route" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
+                                            <div>
+                                                <strong class="text-neutral-700">Architecture rules</strong>
+                                                <span class="text-neutral-500">
+                                                    keep MoE routers in fp16, protect shared experts and output-critical tensors,
+                                                    leave vision/audio encoders unquantized, and preserve SSM state tensors.
+                                                </span>
+                                            </div>
                                         </div>
-                                        <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Streaming</strong> <span class="text-neutral-500">Tensor-by-tensor quantization from safetensors. Use a sensitivity model (pre-quantized proxy) to measure layer ranking at ~4x less memory than float16 calibration.</span></div>
-                                        </div>
-
                                     </div>
                                 </div>
 
-                                <!-- Comparison table -->
                                 <div>
-                                    <h5 class="text-base font-bold text-neutral-700">Comparison with other methods</h5>
-                                    <div class="mt-2 overflow-x-auto">
+                                    <h5 class="text-base font-bold text-neutral-700">What oQe adds</h5>
+                                    <p class="mt-2">
+                                        oQe uses the same oQ sensitivity planner, then adds an importance-matrix calibration step.
+                                        This is explicitly borrowed from the llama.cpp imatrix idea: collect activation energy from
+                                        representative prompts, then use that information so quantization spends less error on the
+                                        input channels that matter most.
+                                    </p>
+                                    <div class="mt-3 overflow-x-auto">
                                         <table class="w-full text-xs">
                                             <thead>
                                                 <tr class="border-b border-neutral-200">
-                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600"></th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">oQ</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">GGUF K-quant</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">GGUF IQ</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">unsloth Dynamic</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">AWQ</th>
+                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600">Path</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Bit allocation</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Affine quantization</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Best use</th>
                                                 </tr>
                                             </thead>
                                             <tbody class="text-neutral-500">
                                                 <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Format</td>
-                                                    <td class="py-1.5 px-3">MLX safetensors</td>
-                                                    <td class="py-1.5 px-3">GGUF</td>
-                                                    <td class="py-1.5 px-3">GGUF</td>
-                                                    <td class="py-1.5 px-3">GGUF</td>
-                                                    <td class="py-1.5 px-3">safetensors</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Mixed precision</td>
-                                                    <td class="py-1.5 px-3">Data-driven sensitivity (per-layer MSE)</td>
-                                                    <td class="py-1.5 px-3">~15 type rules</td>
-                                                    <td class="py-1.5 px-3">imatrix per-weight</td>
-                                                    <td class="py-1.5 px-3">Per-layer (proprietary)</td>
-                                                    <td class="py-1.5 px-3">Per-channel scaling</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Hybrid modes</td>
-                                                    <td class="py-1.5 px-3">Affine (group_size=64)</td>
-                                                    <td class="py-1.5 px-3">K-quant types</td>
-                                                    <td class="py-1.5 px-3">E8 lattice</td>
-                                                    <td class="py-1.5 px-3">Proprietary</td>
-                                                    <td class="py-1.5 px-3">Affine only</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">MoE support</td>
-                                                    <td class="py-1.5 px-3">Router fp16, expert-aware budget</td>
-                                                    <td class="py-1.5 px-3">Basic</td>
-                                                    <td class="py-1.5 px-3">Basic</td>
-                                                    <td class="py-1.5 px-3">Router fp16</td>
-                                                    <td class="py-1.5 px-3">Limited</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">VLM / SSM</td>
-                                                    <td class="py-1.5 px-3">Vision fp16, SSM F32 state</td>
-                                                    <td class="py-1.5 px-3">Separate mmproj, F32 state</td>
-                                                    <td class="py-1.5 px-3">Separate mmproj, F32 state</td>
-                                                    <td class="py-1.5 px-3">Supported</td>
-                                                    <td class="py-1.5 px-3">Not tested</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Calibration</td>
-                                                    <td class="py-1.5 px-3">Built-in 600 samples (code + multilingual + reasoning)</td>
-                                                    <td class="py-1.5 px-3">None</td>
-                                                    <td class="py-1.5 px-3">imatrix required</td>
-                                                    <td class="py-1.5 px-3">Proprietary data</td>
-                                                    <td class="py-1.5 px-3">Activation data</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Memory</td>
-                                                    <td class="py-1.5 px-3">Streaming (~5-7GB)</td>
-                                                    <td class="py-1.5 px-3">1× model</td>
-                                                    <td class="py-1.5 px-3">1× model</td>
-                                                    <td class="py-1.5 px-3">Proprietary</td>
-                                                    <td class="py-1.5 px-3">1.5× model</td>
+                                                    <td class="py-2 pr-4 font-medium text-neutral-600">oQ</td>
+                                                    <td class="py-2 px-3">Layer-sensitivity mixed precision</td>
+                                                    <td class="py-2 px-3">Standard min/max affine per group</td>
+                                                    <td class="py-2 px-3">Fast, deterministic conversion with strong baseline quality</td>
                                                 </tr>
                                                 <tr>
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Apple Silicon</td>
-                                                    <td class="py-1.5 px-3">Native (MLX affine)</td>
-                                                    <td class="py-1.5 px-3">Via llama.cpp</td>
-                                                    <td class="py-1.5 px-3">Via llama.cpp</td>
-                                                    <td class="py-1.5 px-3">GGUF only</td>
-                                                    <td class="py-1.5 px-3">MLX (affine)</td>
+                                                    <td class="py-2 pr-4 font-medium text-neutral-600">oQe</td>
+                                                    <td class="py-2 px-3">Same oQ plan</td>
+                                                    <td class="py-2 px-3">imatrix-weighted clipping/search per group</td>
+                                                    <td class="py-2 px-3">Better low-bit retention, especially for MoE and activation-skewed layers</td>
                                                 </tr>
                                             </tbody>
                                         </table>
                                     </div>
                                 </div>
 
+                                <div>
+                                    <h5 class="text-base font-bold text-neutral-700">How oQe imatrix works</h5>
+                                    <div class="mt-3 space-y-3">
+                                        <div class="flex gap-3">
+                                            <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">1</span>
+                                            <div>
+                                                <strong class="text-neutral-700">Collect activation energy.</strong>
+                                                <span class="text-neutral-500">
+                                                    oQe runs calibration samples through the model and records average input
+                                                    activation squared, E[x^2], for each quantized Linear input channel.
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">2</span>
+                                            <div>
+                                                <strong class="text-neutral-700">Track experts separately.</strong>
+                                                <span class="text-neutral-500">
+                                                    For MoE SwitchLinear layers, oQe records one importance vector per expert using
+                                                    the router-selected expert indices, so inactive or rarely active experts are
+                                                    visible in the coverage report.
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">3</span>
+                                            <div>
+                                                <strong class="text-neutral-700">Adapt sample count.</strong>
+                                                <span class="text-neutral-500">
+                                                    Calibration starts from the requested sample count and can continue up to the
+                                                    adaptive maximum when MoE expert coverage is not sufficient.
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">4</span>
+                                            <div>
+                                                <strong class="text-neutral-700">Weight the quantization error.</strong>
+                                                <span class="text-neutral-500">
+                                                    During affine quantization, oQe chooses scale/bias candidates by minimizing
+                                                    sum(importance * (weight - dequantized_weight)^2), not plain unweighted MSE.
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <p class="mt-3 text-xs text-neutral-400">
+                                        If a tensor has no matching imatrix entry, the default behavior is to fall back to standard
+                                        oQ for that tensor. Enable strict coverage to fail instead.
+                                    </p>
+                                </div>
                             </div>
                         </div>
                     </div>
