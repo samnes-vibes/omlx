@@ -407,8 +407,6 @@
             oqEnhanced: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
-            oqeCalibrationSamples: 128,
-            oqeSequenceLength: 512,
             oqeStrictImatrix: false,
 
             // oQ Uploader state
@@ -4279,14 +4277,10 @@
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
                     };
                     if (this.oqEnhanced) {
-                        const imatrixSamples = parseInt(this.oqeCalibrationSamples, 10);
-                        const imatrixSeqLength = parseInt(this.oqeSequenceLength, 10);
                         payload.enhanced = true;
                         payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
                         payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
                         payload.imatrix_strict = this.oqeStrictImatrix;
-                        payload.imatrix_num_samples = Number.isFinite(imatrixSamples) ? imatrixSamples : 128;
-                        payload.imatrix_seq_length = Number.isFinite(imatrixSeqLength) ? imatrixSeqLength : 512;
                     }
                     const response = await fetch('/admin/api/oq/start', {
                         method: 'POST',
@@ -4389,6 +4383,10 @@
                     m.is_quantized &&
                     m.model_type === source.model_type
                 );
+            },
+
+            oqLevelLabel(level) {
+                return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
             },
 
             oqSelectedModelIsVLM() {
