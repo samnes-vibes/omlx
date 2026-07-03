@@ -4,6 +4,7 @@
 import importlib
 import inspect
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -959,6 +960,63 @@ class TestMakeQuantizationConfigMtp:
 
         qcfg = dsv4.make_quantization_config(_ModelStub())
         assert not any(k.startswith("mtp.") for k in qcfg)
+
+
+class TestDeepSeekV4SanitizeAffineSwitchMLP:
+    """Sanitize should enable the FP16 affine routed-MoE fast path."""
+
+    def test_affine_switch_mlp_scale_bias_cast_to_fp16(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        fake_model = SimpleNamespace(
+            args=SimpleNamespace(
+                num_hidden_layers=1,
+                n_routed_experts=2,
+                o_groups=1,
+                o_lora_rank=1,
+            )
+        )
+        weights = {
+            "model.layers.0.ffn.switch_mlp.up_proj.weight": mx.zeros(
+                (2, 4, 2), dtype=mx.uint32
+            ),
+            "model.layers.0.ffn.switch_mlp.up_proj.scales": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.up_proj.biases": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.weight": mx.zeros(
+                (2, 4, 2), dtype=mx.uint32
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.scales": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.biases": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.shared_experts.up_proj.scales": mx.zeros(
+                (4, 1), dtype=mx.bfloat16
+            ),
+        }
+
+        out = dsv4.Model.sanitize(fake_model, dict(weights))
+
+        assert out["model.layers.0.ffn.switch_mlp.up_proj.scales"].dtype == mx.float16
+        assert out["model.layers.0.ffn.switch_mlp.up_proj.biases"].dtype == mx.float16
+        assert (
+            out["model.layers.0.ffn.switch_mlp.down_proj.scales"].dtype
+            == mx.float16
+        )
+        assert (
+            out["model.layers.0.ffn.switch_mlp.down_proj.biases"].dtype
+            == mx.float16
+        )
+        assert (
+            out["model.layers.0.ffn.shared_experts.up_proj.scales"].dtype
+            == mx.bfloat16
+        )
 
 
 class TestMtpSanitizeWoAReshape:

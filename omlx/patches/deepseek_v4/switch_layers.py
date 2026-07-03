@@ -201,8 +201,35 @@ class QuantizedSwitchLinear(nn.Module):
             and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_blocks")
         )
 
-    def __call__(self, x, indices, sorted_indices=False, block_plan=None):
+    def _can_use_affine_blocks(self, x, sorted_indices: bool, dtype=None) -> bool:
+        dtype = dtype or x.dtype
+        biases = self.get("biases")
+        return (
+            sorted_indices
+            and x.ndim == 3
+            and x.shape[-2] == 1
+            and dtype in (mx.float16, mx.bfloat16)
+            and self.group_size == 64
+            and self.bits in (2, 3)
+            and self.mode == "affine"
+            and biases is not None
+            and "bias" not in self
+            and self["weight"].dtype == mx.uint32
+            and self["scales"].dtype == dtype
+            and biases.dtype == dtype
+            and glm_fast.has_symbol("deepseek_affine_gather_qmm_blocks")
+        )
+
+    def _native_block_kind(self, x, sorted_indices: bool, dtype=None) -> str | None:
         if self._can_use_mxfp4_blocks(x, sorted_indices):
+            return "mxfp4"
+        if self._can_use_affine_blocks(x, sorted_indices, dtype=dtype):
+            return "affine"
+        return None
+
+    def __call__(self, x, indices, sorted_indices=False, block_plan=None):
+        native_kind = self._native_block_kind(x, sorted_indices)
+        if native_kind is not None:
             if block_plan is None:
                 block_bm, block_variant = _mxfp4_block_config(indices.size)
                 block_meta, block_count = _build_mxfp4_blocks(
@@ -214,14 +241,27 @@ class QuantizedSwitchLinear(nn.Module):
                 block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                     block_plan
                 )
-            x = glm_fast.deepseek_mxfp4_gather_qmm_blocks(
-                x,
-                self["weight"],
-                self["scales"],
-                block_meta,
-                block_count,
-                block_variant,
-            )
+            if native_kind == "mxfp4":
+                x = glm_fast.deepseek_mxfp4_gather_qmm_blocks(
+                    x,
+                    self["weight"],
+                    self["scales"],
+                    block_meta,
+                    block_count,
+                    block_variant,
+                )
+            else:
+                x = glm_fast.deepseek_affine_gather_qmm_blocks(
+                    x,
+                    self["weight"],
+                    self["scales"],
+                    self["biases"],
+                    block_meta,
+                    block_count,
+                    self.group_size,
+                    self.bits,
+                    block_variant,
+                )
         else:
             x = mx.gather_qmm(
                 x,
@@ -268,6 +308,7 @@ class SwitchLinear(nn.Module):
         return self.weight.shape[0]
 
     def __call__(self, x, indices, sorted_indices=False, block_plan=None):
+        del block_plan
         x = mx.gather_mm(
             x,
             self["weight"].swapaxes(-1, -2),
@@ -336,29 +377,52 @@ class SwitchGLU(nn.Module):
             idx = mx.stop_gradient(idx)
 
         block_plan = None
+        native_kinds = None
+        use_f16_moe = False
         projections = (self.up_proj, self.gate_proj, self.down_proj)
-        if (
-            do_sort
-            and all(isinstance(p, QuantizedSwitchLinear) for p in projections)
-            and all(p._can_use_mxfp4_blocks(x, do_sort) for p in projections)
-        ):
-            block_bm, block_variant = _mxfp4_block_config(idx.size)
-            block_meta, block_count = _build_mxfp4_blocks(
-                idx,
-                self.up_proj.num_experts,
-                block_bm,
-            )
-            block_plan = (block_meta, block_count, block_variant)
+        if do_sort and all(isinstance(p, QuantizedSwitchLinear) for p in projections):
+            native_kinds = tuple(p._native_block_kind(x, do_sort) for p in projections)
+            if x.dtype == mx.bfloat16:
+                f16_native_kinds = tuple(
+                    p._native_block_kind(x, do_sort, dtype=mx.float16)
+                    for p in projections
+                )
+                if all(kind == "mxfp4" for kind in f16_native_kinds) or all(
+                    kind == "affine" for kind in f16_native_kinds
+                ):
+                    native_kinds = f16_native_kinds
+                    use_f16_moe = True
+            if all(kind is not None for kind in native_kinds):
+                block_bm, block_variant = _mxfp4_block_config(idx.size)
+                block_meta, block_count = _build_mxfp4_blocks(
+                    idx,
+                    self.up_proj.num_experts,
+                    block_bm,
+                )
+                block_plan = (block_meta, block_count, block_variant)
 
-        use_f16_moe = block_plan is not None and x.dtype == mx.bfloat16
         if use_f16_moe:
             x = x.astype(mx.float16)
 
         use_pair_proj = (
             block_plan is not None
+            and native_kinds is not None
+            and native_kinds[0] == "mxfp4"
+            and native_kinds[1] == "mxfp4"
             and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_pair_blocks")
             and self.up_proj.output_dims == self.gate_proj.output_dims
             and self.up_proj.num_experts == self.gate_proj.num_experts
+        )
+        use_affine_pair_proj = (
+            block_plan is not None
+            and native_kinds is not None
+            and native_kinds[0] == "affine"
+            and native_kinds[1] == "affine"
+            and self.up_proj.group_size == self.gate_proj.group_size
+            and self.up_proj.bits == self.gate_proj.bits
+            and self.up_proj.output_dims == self.gate_proj.output_dims
+            and self.up_proj.num_experts == self.gate_proj.num_experts
+            and glm_fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks")
         )
         if use_pair_proj:
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
@@ -391,23 +455,50 @@ class SwitchGLU(nn.Module):
                 )
                 x_up = x_pair[0]
                 x_gate = x_pair[1]
+        elif use_affine_pair_proj:
+            block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
+                block_plan
+            )
+            x_pair = glm_fast.deepseek_affine_gather_qmm_pair_concat_blocks(
+                x,
+                self.up_proj["weight"],
+                self.up_proj["scales"],
+                self.up_proj["biases"],
+                self.gate_proj["weight"],
+                self.gate_proj["scales"],
+                self.gate_proj["biases"],
+                block_meta,
+                block_count,
+                self.up_proj.group_size,
+                self.up_proj.bits,
+                block_variant,
+            )
+            hidden_dims = self.up_proj.output_dims
+            x_up = x_pair[..., :hidden_dims]
+            x_gate = x_pair[..., hidden_dims:]
         else:
             x_up = self.up_proj(x, idx, sorted_indices=do_sort, block_plan=block_plan)
             x_gate = self.gate_proj(
                 x, idx, sorted_indices=do_sort, block_plan=block_plan
             )
+        x = self.activation(x_up, x_gate)
+        if (
+            block_plan is not None
+            and native_kinds is not None
+            and native_kinds[2] == "affine"
+            and isinstance(self.down_proj, QuantizedSwitchLinear)
+            and x.dtype != self.down_proj["scales"].dtype
+            and self.down_proj["scales"].dtype in (mx.float16, mx.bfloat16)
+        ):
+            x = x.astype(self.down_proj["scales"].dtype)
         x = self.down_proj(
-            self.activation(x_up, x_gate),
+            x,
             idx,
             sorted_indices=do_sort,
             block_plan=block_plan,
         )
 
         if do_sort:
-            # Keep the reference scatter path for DeepSeek V4. The fused
-            # weighted-sum kernel changes long-context prefix snapshot state
-            # enough to make greedy cache-hit decoding diverge from fresh
-            # prefill, while the MXFP4 expert GEMM path remains stable.
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         x = x.squeeze(-2)

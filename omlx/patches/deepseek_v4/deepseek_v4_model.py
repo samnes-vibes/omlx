@@ -1257,6 +1257,22 @@ class Model(nn.Module):
                             f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
                         ] = mx.stack(stacked)
 
+        for key, value in list(weights.items()):
+            if (
+                ".ffn.switch_mlp." not in key
+                or not key.endswith((".scales", ".biases"))
+                or value.dtype != mx.bfloat16
+            ):
+                continue
+            stem = key.rsplit(".", 1)[0]
+            if (
+                stem + ".weight" in weights
+                and stem + ".scales" in weights
+                and stem + ".biases" in weights
+                and weights[stem + ".weight"].dtype == mx.uint32
+            ):
+                weights[key] = value.astype(mx.float16)
+
         # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for all layers
         for layer_idx in range(n_layers):
             prefix = f"model.layers.{layer_idx}.attn.wo_a"
