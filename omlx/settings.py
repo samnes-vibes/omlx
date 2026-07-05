@@ -254,11 +254,35 @@ class ModelSettings:
         )
 
 
+# Below this total-RAM threshold, admitting the old flat default of 8
+# concurrent requests collides with the prefill memory guard before it
+# buys meaningful throughput. Matches the small-system threshold in
+# process_memory_enforcer.py (kept as a literal here rather than importing
+# that private constant, to avoid a settings -> process_memory_enforcer
+# import that reverses the existing dependency direction).
+_SMALL_SYSTEM_RAM_THRESHOLD = 24 * 1024**3
+_SMALL_SYSTEM_MAX_CONCURRENT_REQUESTS = 4
+_DEFAULT_MAX_CONCURRENT_REQUESTS = 8
+
+
+def _default_max_concurrent_requests() -> int:
+    """RAM-aware default for `max_concurrent_requests` (#lowram perf pass).
+
+    On an 8 GB Mac mini, batching measurements showed tg throughput
+    flattening past 4x concurrency (1.49x/1.72x/1.77x for 2x/4x/8x) while
+    TTFT kept degrading roughly linearly, so 4 captures nearly all of the
+    real win without admitting requests the prefill guard will just throttle.
+    """
+    if get_system_memory() < _SMALL_SYSTEM_RAM_THRESHOLD:
+        return _SMALL_SYSTEM_MAX_CONCURRENT_REQUESTS
+    return _DEFAULT_MAX_CONCURRENT_REQUESTS
+
+
 @dataclass
 class SchedulerSettings:
     """Scheduler configuration settings."""
 
-    max_concurrent_requests: int = 8
+    max_concurrent_requests: int = field(default_factory=_default_max_concurrent_requests)
     embedding_batch_size: int = 32
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
@@ -278,7 +302,7 @@ class SchedulerSettings:
         if value is None:
             value = data.get("completion_batch_size")
         if value is None:
-            value = 8
+            value = _default_max_concurrent_requests()
         embedding_batch_size = data.get("embedding_batch_size", 32)
         return cls(
             max_concurrent_requests=value,
