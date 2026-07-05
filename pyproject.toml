@@ -57,7 +57,7 @@ dependencies = [
     # (AttributeError: 'str' object has no attribute '__module__'). Every
     # `import mlx_lm` fails on a fresh resolve. Lift once the mlx-lm pin
     # advances past a fix.
-    "transformers>=5.7.0,<5.13",
+    "transformers>=5.7.0,<5.14",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
