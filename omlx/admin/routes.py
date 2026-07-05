@@ -146,6 +146,11 @@ class ModelSettingsRequest(BaseModel):
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
+    # N-gram / prompt-lookup speculative decoding (draft-model-free)
+    ngram_spec_enabled: bool | None = None
+    ngram_spec_min_n: int | None = None
+    ngram_spec_max_n: int | None = None
+    ngram_spec_max_draft: int | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -511,6 +516,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
     settings["mtp_enabled"] = False
     settings["vlm_mtp_enabled"] = False
+    settings["ngram_spec_enabled"] = False
 
     unsupported_ct_kwargs = {
         "enable_thinking",
@@ -597,6 +603,10 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_draft_sink_size = None
     settings.dflash_verify_mode = None
     settings.mtp_enabled = False
+    settings.ngram_spec_enabled = False
+    settings.ngram_spec_min_n = None
+    settings.ngram_spec_max_n = None
+    settings.ngram_spec_max_draft = None
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
     settings.vlm_mtp_draft_block_size = None
@@ -1728,6 +1738,22 @@ def _models_from_docstring(fn) -> list[str]:
     ]
 
 
+@router.get("/api/ngram-spec/stats")
+async def get_ngram_spec_stats(
+    reset: bool = False, is_admin: bool = Depends(require_admin)
+):
+    """Cumulative n-gram speculative-decoding counters.
+
+    ``requests / cycles / plain_steps / proposed_tokens / accepted_tokens``
+    plus emit and timing breakdowns, summed over finished requests since
+    server start (or the last ``?reset=true`` call — used by
+    ``scripts/spec_bench.py`` to isolate per-scenario acceptance rates).
+    """
+    from ..patches.ngram_spec import get_ngram_spec_totals
+
+    return {"totals": get_ngram_spec_totals(reset=reset)}
+
+
 @router.get("/api/grammar/parsers")
 async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     """Return available reasoning parser names from xgrammar.
@@ -2424,6 +2450,51 @@ async def update_model_settings(
                 )
         current_settings.mtp_enabled = new_mtp_enabled
 
+    # N-gram / prompt-lookup speculative decoding (draft-model-free)
+    if "ngram_spec_enabled" in sent:
+        new_ngram = False if is_diffusion_model else bool(request.ngram_spec_enabled)
+        if new_ngram:
+            for other_field, other_label in (
+                ("mtp_enabled", "MTP"),
+                ("dflash_enabled", "DFlash"),
+                ("vlm_mtp_enabled", "VLM MTP"),
+            ):
+                other_after = (
+                    bool(getattr(request, other_field))
+                    if other_field in sent
+                    else getattr(current_settings, other_field)
+                )
+                if other_after:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"N-gram speculation and {other_label} cannot both be "
+                            "enabled; choose one speculative-decoding path."
+                        ),
+                    )
+        current_settings.ngram_spec_enabled = new_ngram
+    for _ngram_field, _lo, _hi in (
+        ("ngram_spec_min_n", 1, 16),
+        ("ngram_spec_max_n", 1, 16),
+        ("ngram_spec_max_draft", 1, 64),
+    ):
+        if _ngram_field in sent:
+            value = getattr(request, _ngram_field)
+            setattr(
+                current_settings,
+                _ngram_field,
+                int(value) if value is not None and _lo <= value <= _hi else None,
+            )
+    if (
+        current_settings.ngram_spec_min_n is not None
+        and current_settings.ngram_spec_max_n is not None
+        and current_settings.ngram_spec_max_n < current_settings.ngram_spec_min_n
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="ngram_spec_max_n must be >= ngram_spec_min_n.",
+        )
+
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
         new_vlm_mtp = False if is_diffusion_model else bool(request.vlm_mtp_enabled)
@@ -2557,6 +2628,11 @@ async def update_model_settings(
         or "dflash_in_memory_cache_max_bytes" in sent
         or "dflash_ssd_cache" in sent
         or "dflash_ssd_cache_max_bytes" in sent
+        # ngram spec is activated at engine construction time
+        or "ngram_spec_enabled" in sent
+        or "ngram_spec_min_n" in sent
+        or "ngram_spec_max_n" in sent
+        or "ngram_spec_max_draft" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent

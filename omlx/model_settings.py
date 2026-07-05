@@ -90,6 +90,12 @@ class ModelSettings:
             continuous batches fall back to standard decoding automatically. Compatible
             model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
             dflash_enabled and turboquant_kv_enabled.
+        ngram_spec_enabled: Enable n-gram / prompt-lookup speculative decoding
+            (draft-model-free; drafts from the request's own token stream).
+            Mutually exclusive with mtp_enabled, dflash_enabled and vlm_mtp_enabled.
+        ngram_spec_min_n: Shortest n-gram to match (None = default 2).
+        ngram_spec_max_n: Longest n-gram to match (None = default 4).
+        ngram_spec_max_draft: Max draft tokens proposed per cycle (None = default 8).
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model.
@@ -192,6 +198,18 @@ class ModelSettings:
     # with dflash and turboquant.
     mtp_enabled: bool = False
 
+    # N-gram / prompt-lookup speculative decoding (draft-model-free). Drafts
+    # come from matching the recent token suffix against the prompt +
+    # generation history; the target model verifies them in one forward.
+    # Works on any architecture whose caches can roll back (trimmable KV, or
+    # hybrid GDN models exposing rollback_speculative_cache). Effective on
+    # echo-heavy workloads (summarization, code edit, RAG); ~neutral elsewhere.
+    # Mutually exclusive with the other speculative-decoding paths.
+    ngram_spec_enabled: bool = False
+    ngram_spec_min_n: Optional[int] = None  # None = default 2
+    ngram_spec_max_n: Optional[int] = None  # None = default 4
+    ngram_spec_max_draft: Optional[int] = None  # None = default 8
+
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
@@ -234,6 +252,19 @@ class ModelSettings:
                 "mtp_enabled and turboquant_kv_enabled cannot both be True; "
                 "TurboQuant patches the attention path that MTP relies on"
             )
+        # N-gram speculation is one speculative path among several — exactly
+        # one may drive a model's decode loop.
+        if self.ngram_spec_enabled:
+            for name, value in (
+                ("mtp_enabled", self.mtp_enabled),
+                ("dflash_enabled", self.dflash_enabled),
+                ("vlm_mtp_enabled", self.vlm_mtp_enabled),
+            ):
+                if value:
+                    raise ValueError(
+                        f"ngram_spec_enabled and {name} cannot both be True; "
+                        "choose one speculative-decoding path per model"
+                    )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
         # or with TurboQuant (which mutates the same cache objects).

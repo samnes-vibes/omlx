@@ -304,6 +304,17 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
+        # N-gram / prompt-lookup speculative decoding (draft-model-free).
+        if self._model_settings is not None and getattr(
+            self._model_settings, "ngram_spec_enabled", False
+        ):
+            try:
+                from ..patches.ngram_spec import activate_ngram_spec
+
+                activate_ngram_spec(self._model, self._model_settings)
+            except Exception:
+                logger.warning("NgramSpec activation failed", exc_info=True)
+
         # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
         # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
         # below their context window. Installed after TurboQuant so it is the

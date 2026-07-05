@@ -777,5 +777,11 @@
   "js.error.delete_model_failed": "Falha ao apagar o modelo",
   "js.error.delete_model_connection": "Falha ao apagar o modelo. Verifique a conexão com o servidor.",
   "js.success.download_started": "Download iniciado: {repo_id}",
-  "js.success.settings_saved": "Configurações salvas com sucesso"
+  "js.success.settings_saved": "Configurações salvas com sucesso",
+  "modal.model_settings.ngram_spec": "N-gram Speculative Decoding",
+  "modal.model_settings.ngram_spec_hint": "Draft-model-free speculation: reuses matching n-grams from the prompt and generated text as draft tokens, verified by the model in one pass. Best on summarization, code editing and RAG; neutral on freeform chat. Lossless.",
+  "modal.model_settings.ngram_spec_conflict": "Disable other speculative decoding paths (MTP / DFlash / VLM MTP) first.",
+  "modal.model_settings.ngram_spec_min_n": "Min n-gram",
+  "modal.model_settings.ngram_spec_max_n": "Max n-gram",
+  "modal.model_settings.ngram_spec_max_draft": "Max draft tokens"
 }

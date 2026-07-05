@@ -777,5 +777,11 @@
   "js.error.delete_model_failed": "モデルの削除に失敗しました",
   "js.error.delete_model_connection": "モデルの削除に失敗しました。サーバー接続を確認してください。",
   "js.success.download_started": "ダウンロード開始: {repo_id}",
-  "js.success.settings_saved": "設定が保存されました"
+  "js.success.settings_saved": "設定が保存されました",
+  "modal.model_settings.ngram_spec": "N-gram Speculative Decoding",
+  "modal.model_settings.ngram_spec_hint": "Draft-model-free speculation: reuses matching n-grams from the prompt and generated text as draft tokens, verified by the model in one pass. Best on summarization, code editing and RAG; neutral on freeform chat. Lossless.",
+  "modal.model_settings.ngram_spec_conflict": "Disable other speculative decoding paths (MTP / DFlash / VLM MTP) first.",
+  "modal.model_settings.ngram_spec_min_n": "Min n-gram",
+  "modal.model_settings.ngram_spec_max_n": "Max n-gram",
+  "modal.model_settings.ngram_spec_max_draft": "Max draft tokens"
 }
