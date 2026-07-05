@@ -1,7 +1,9 @@
 # N-gram / Prompt-Lookup Speculative Decoding — Implementation Plan
 
-Date: 2026-07-05
+Date: 2026-07-05 (results appended same day — see "Measured results" at the end)
 Branch: `feat/ngram-spec-decoding`
+Status: **implemented** (`omlx/speculative/ngram.py`, `omlx/patches/ngram_spec.py`,
+`scripts/spec_bench.py`; enabled per-model via `ngram_spec_enabled`)
 Companion to: [5x_speedup_research.md](5x_speedup_research.md) (item A2.1, ranked #1 in recommended order),
 [low_ram_perf_optimization_map.md](low_ram_perf_optimization_map.md) (items 0, 2a, 2d)
 
@@ -162,3 +164,59 @@ any n-gram code lands.
 | `omlx/scheduler.py` | proposer lifecycle (admission/emit/cleanup), stats plumbing |
 | `omlx/admin/benchmark.py`, `admin/routes.py`, dashboard templates/js | metrics + toggle |
 | `tests/test_ngram_proposer.py`, `tests/test_ngram_spec_decoding.py` | new |
+
+---
+
+## Measured results (2026-07-05, reference machine)
+
+Hardware: M1 Mac mini 8 GB (compute-bound decode — the *worst case* for
+speculative decoding per the MTP cost-model note). Model:
+`Qwen3.5-0.8B-MLX-4bit` via VLM engine (hybrid GDN → gdn rollback mode).
+`scripts/spec_bench.py --ab --runs 3`, temp=0, median of 3:
+
+| scenario  | off tok/s | on tok/s | speedup | accept | notes |
+|-----------|-----------|----------|---------|--------|-------|
+| code_edit | 110.0 | 144.6 | **1.31x** | 96 % | 4.8 tokens/forward on hit streaks |
+| freeform  | 104.2 | 95.5  | 0.92x | 0 %  | gates disable spec after ~4 cycles |
+| summarize | 107.6 | 96.7  | 0.90x | 40 % | verify too costly at this accept rate (see below) |
+| rag       | 208.6 | 145.3 | 0.70x | 43 % | 16-token responses; dominated by probe + first cycles |
+
+### What was learned
+
+1. **The verify forward is expensive on this path**: a 9-token gdn-capture
+   verify measures ~60 ms vs ~9.6 ms for a plain step (~6.5x, not the ~2x a
+   bandwidth-bound machine would pay). Two independent reasons: M1 decode is
+   compute-bound, and the capture forward takes mlx-vlm's `target_verify`
+   kernels (dequantized verify linears). Breakeven acceptance is therefore
+   ~70 % here — only the code_edit-class workloads clear it. On trim-mode
+   models (plain transformers) and on M3/M4-class machines both factors
+   shrink, so the economics improve wholesale; re-benchmark there.
+2. **The miss path must cost exactly zero.** Proposal misses delegate to the
+   pre-patch stock step, and lookups anchor at the last *emitted* token
+   (whose host-side id is free) so a miss adds no GPU sync. Earlier versions
+   that ran their own plain step, or synced the pending sample every step,
+   lost 25 % throughput on freeform from broken async pipelining alone.
+3. **Adaptive gates are mandatory**: exponential backoff on consecutive
+   zero-accept cycles, plus a measured cycle-cost vs plain-step-cost EMA
+   gate (two strikes → speculation off for the request). These cap the
+   worst-case regression to the first few cycles of a request.
+4. **Greedy identity**: bit-exact in trim mode (asserted by unit tests across
+   draft lengths, stop tokens, max_tokens). On the hybrid gdn path the
+   capture forward computes logits through higher-precision verify kernels,
+   so argmax can differ from the stock path at near-ties (~1 divergence per
+   few hundred tokens observed; each continuation is self-consistent and a
+   valid greedy output of the same model). This is the same caveat that
+   applies to the mlx-vlm MTP/EAGLE paths using those kernels.
+5. TurboQuant KV + gdn capture is incompatible (`_QuantizedStateProxy` is not
+   subscriptable in the target_verify attention path); detected up front and
+   speculation stays off rather than crashing.
+
+### Follow-ups
+
+- Benchmark on bandwidth-bound hardware (M3/M4/Max) and on a trim-mode
+  model — both remove the dominant cost factor measured here.
+- Investigate a non-capture verify for the all-accepted fast path, or a
+  cheaper gdn rollback that avoids `target_verify` kernels.
+- Adaptive draft length (scale K with rolling acceptance).
+- Phase 1 acceptance metrics in the admin dashboard (stats endpoint exists:
+  `GET /admin/api/ngram-spec/stats`).

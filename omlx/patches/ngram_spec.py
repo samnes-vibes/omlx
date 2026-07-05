@@ -180,11 +180,35 @@ class _NgramState:
     proposer: Optional[NgramProposer] = None
     # Newest sampled token: not in cache, not emitted, next forward input.
     next_main: Optional[Any] = None  # (1,) uint32
+    # Host-side int of next_main; -1 = not yet resolved (plain steps leave
+    # the sample lazily evaluating on the GPU, mirroring stock async_eval
+    # pipelining; the id is resolved at the start of the next cycle).
     next_main_id: int = -1
     next_main_lp: Optional[Any] = None  # (vocab,)
     rollback_mode: str = "trim"  # "trim" | "gdn"
     # gdn mode: capture support proven by a 1-token probe step.
     gdn_verified: bool = False
+    # Adaptive backoff: consecutive zero-accept cycles and the step counter
+    # value until which proposals are suppressed (exponential, capped).
+    reject_streak: int = 0
+    step_counter: int = 0
+    skip_until_step: int = 0
+    # Cycle-economics EMAs (ms): on compute-bound hardware a (K+1)-token
+    # verify can cost more than the tokens it earns; when the measured
+    # per-token cycle cost exceeds the plain-step cost, speculation is
+    # suppressed for a window and re-probed later.
+    ema_plain_ms: Optional[float] = None
+    ema_cycle_ms: Optional[float] = None
+    ema_cycle_tokens: Optional[float] = None
+    # Delegated-step wall times only become a fair plain-step estimate once
+    # the pipeline reaches steady state (early samples can measure just the
+    # dispatch cost while the GPU runs ahead) — the first samples are
+    # discarded and several are required before the gate may fire.
+    plain_samples: int = 0
+    # Economics-gate strikes: the second firing disables speculation for the
+    # remainder of the request (re-probing costs a full verify each time).
+    econ_strikes: int = 0
+    speculation_disabled: bool = False
     stats: _NgramStats = field(default_factory=_NgramStats)
     _finished: bool = False
 
@@ -253,6 +277,9 @@ def apply() -> bool:
         GenerationBatch.next = patched_next
         GenerationBatch.extend = patched_extend
         GenerationBatch.filter = patched_filter
+        # Proposal misses delegate the step to the pre-patch next() so the
+        # miss path costs exactly a stock step (no per-token overhead).
+        GenerationBatch._omlx_ngram_delegate_next = original_next
         GenerationBatch._omlx_ngram_patched = True
 
     if not hasattr(BatchGenerator, "_omlx_ngram_patched"):
@@ -439,12 +466,30 @@ def _resolve_rollback_target(model: Any) -> Optional[Any]:
     return None
 
 
+def _has_quantized_kv(prompt_cache: List[Any]) -> bool:
+    """True when any layer holds a TurboQuant (or otherwise quantized) KV cache.
+
+    The gdn capture forward switches the model into its ``target_verify``
+    attention path, which slices raw ``keys``/``values`` — quantized state
+    proxies are not subscriptable there (crashes inside the model), so gdn
+    mode must be refused up front.
+    """
+    for c in prompt_cache:
+        name = type(c).__name__
+        if "TurboQuant" in name or "Quantized" in name:
+            return True
+    return False
+
+
 def _resolve_rollback_mode(gen_batch: Any) -> Optional[str]:
-    if _all_trimmable(getattr(gen_batch, "prompt_cache", None) or []):
+    prompt_cache = getattr(gen_batch, "prompt_cache", None) or []
+    if _all_trimmable(prompt_cache):
         return "trim"
     model = gen_batch.model
-    if _resolve_rollback_target(model) is not None and _model_call_accepts_capture(
-        model
+    if (
+        _resolve_rollback_target(model) is not None
+        and _model_call_accepts_capture(model)
+        and not _has_quantized_kv(prompt_cache)
     ):
         return "gdn"
     return None
@@ -493,8 +538,11 @@ def _prepare_state(gen_batch: Any) -> Optional[_NgramState]:
     state.next_main_lp = next_logprobs[0]
     state.proposer = NgramProposer(cfg)
     t0 = time.perf_counter()
-    # Committed stream = cache contents (tokens[0]) + the pending sample.
-    state.proposer.extend(list(gen_batch.tokens[0]) + [next_main_id])
+    # The proposer tracks *emitted* tokens only (prompt now, generation as
+    # it streams). Lookups anchor at the last emitted token; the pending
+    # sample is compared against the candidate's first element, so its
+    # host-side id is only needed when a candidate actually exists.
+    state.proposer.extend(list(gen_batch.tokens[0]))
     state.stats.propose_ms += (time.perf_counter() - t0) * 1000
 
     gen_batch._omlx_ngram_state = state
@@ -513,19 +561,106 @@ def _prepare_state(gen_batch: Any) -> Optional[_NgramState]:
 
 
 def _ngram_next(gen_batch: Any, state: _NgramState) -> Any:
+    if state.queue:
+        return _pop_and_emit(gen_batch, state)
+
+    if state.next_main is None:
+        raise _NgramStepFallback("step entered without next_main")
+    _set_singleton_mrope_delta(gen_batch)
+    stats = state.stats
+
+    # ---- proposal gates ---------------------------------------------------
+    # The lookup anchors at the last *emitted* token (host-side ints come
+    # free from the emit stream), producing a candidate whose first element
+    # predicts the pending sample. Only when a candidate exists do we pay a
+    # sync to resolve the pending sample's id — a miss (the common case on
+    # non-echoing text) therefore delegates to the stock step with zero
+    # added synchronization, preserving stock pipelining.
+    state.step_counter += 1
+    t0 = time.perf_counter()
+    draft_ids: Optional[List[int]] = None
+    remaining = gen_batch.max_tokens[0] - gen_batch._num_tokens[0]
+    candidate: Optional[List[int]] = None
+    if (
+        remaining > 1
+        and not state.speculation_disabled
+        and state.step_counter >= state.skip_until_step
+    ):
+        if state.rollback_mode == "trim" and not _all_trimmable(
+            gen_batch.prompt_cache
+        ):
+            # e.g. RotatingKVCache after rotation: skip speculation, the
+            # delegated stock step below keeps decoding safely.
+            candidate = None
+        else:
+            candidate = state.proposer.propose(max_draft=remaining)
+    if candidate:
+        if state.next_main_id < 0:
+            # Sync point (proposal path only): by now the pending sample's
+            # async eval has typically completed.
+            state.next_main_id = int(state.next_main.tolist()[0])
+        if candidate[0] == state.next_main_id and len(candidate) > 1:
+            draft_ids = candidate[1:]
+    stats.propose_ms += (time.perf_counter() - t0) * 1000
+
+    if draft_ids:
+        if state.rollback_mode == "gdn" and not state.gdn_verified:
+            # First proposal on a hybrid model: prove gdn capture works with
+            # a risk-free 1-token step before any multi-token forward.
+            _run_probe_step(gen_batch, state)
+        else:
+            _run_verify_cycle(gen_batch, state, draft_ids)
+        return _pop_and_emit(gen_batch, state)
+    return _delegate_plain_step(gen_batch, state)
+
+
+def _pop_and_emit(gen_batch: Any, state: _NgramState) -> Any:
     if not state.queue:
-        _set_singleton_mrope_delta(gen_batch)
-        _run_cycle(gen_batch, state)
-        if not state.queue:
-            raise _NgramStepFallback("cycle produced no emit tokens")
+        raise _NgramStepFallback("cycle produced no emit tokens")
     token_id, logprobs_1d, source = state.queue.popleft()
-    if source == "init":
-        state.stats.init_emits += 1
-    elif source == "draft":
+    if source == "draft":
         state.stats.draft_emits += 1
     else:
         state.stats.plain_emits += 1
     return _emit_response(gen_batch, state, token_id, logprobs_1d)
+
+
+def _delegate_plain_step(gen_batch: Any, state: _NgramState) -> Any:
+    """Proposal miss: run the pre-patch stock step (zero added per-token
+    cost), then re-point the state at the new pending sample."""
+    stats = state.stats
+    stats.plain_steps += 1
+    delegate = type(gen_batch)._omlx_ngram_delegate_next
+    t0 = time.perf_counter()
+    responses = delegate(gen_batch)
+    elapsed = (time.perf_counter() - t0) * 1000
+    state.plain_samples += 1
+    if state.plain_samples > 2:  # discard GPU-ahead warmup samples
+        state.ema_plain_ms = (
+            elapsed
+            if state.ema_plain_ms is None
+            else 0.7 * state.ema_plain_ms + 0.3 * elapsed
+        )
+    stats.plain_emits += len(responses or [])
+    if responses:
+        state.proposer.extend(r.token for r in responses)
+
+    finished = any(r.finish_reason is not None for r in responses or [])
+    if finished or getattr(gen_batch, "_omlx_ngram_state", None) is not state:
+        # The stock finish path already ran filter(); patched_filter dropped
+        # the state. finish() is idempotent, so this only covers the case
+        # where the drop happened without logging.
+        state.finish(state.uid, "finish")
+        return responses
+    next_tokens = getattr(gen_batch, "_next_tokens", None)
+    next_logprobs = getattr(gen_batch, "_next_logprobs", None)
+    if next_tokens is None or not next_logprobs:
+        _drop_state(gen_batch, "stock-step-lost-next-tokens")
+        return responses
+    state.next_main = next_tokens
+    state.next_main_id = -1  # resolved lazily next step
+    state.next_main_lp = next_logprobs[0]
+    return responses
 
 
 def _forward(
@@ -557,171 +692,194 @@ def _gdn_states_usable(gdn_states: Optional[list]) -> bool:
     )
 
 
-def _run_cycle(gen_batch: Any, state: _NgramState) -> None:
-    """Run one decode cycle: speculative verify on a proposal, else a plain
-    1-token step. Populates ``state.queue`` with >= 1 emit."""
-    import mlx.core as mx
+def _run_probe_step(gen_batch: Any, state: _NgramState) -> None:
+    """One manual 1-token step with gdn capture enabled.
 
-    if state.next_main is None:
-        raise _NgramStepFallback("cycle entered without next_main")
+    Verifies that ``capture_layer_ids`` reaches the language model and that
+    usable gdn states come back, without ever leaving the cache in an
+    unrecoverable condition (a 1-token forward needs no rollback). On
+    success ``gdn_verified`` flips and the next proposal speculates; on
+    failure the model is marked unsupported and this request keeps
+    delegating to stock steps.
+    """
+    import mlx.core as mx
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
     stats = state.stats
+    stats.plain_steps += 1
 
-    # ---- proposal --------------------------------------------------------
+    next_main = _ensure_uint32(state.next_main)
     t0 = time.perf_counter()
-    draft_ids: Optional[List[int]] = None
-    remaining = gen_batch.max_tokens[0] - gen_batch._num_tokens[0]
-    gdn_ready = state.rollback_mode != "gdn" or state.gdn_verified
-    if remaining > 1 and gdn_ready:
-        if state.rollback_mode == "trim" and not _all_trimmable(
-            gen_batch.prompt_cache
-        ):
-            # e.g. RotatingKVCache after rotation: skip speculation, the
-            # plain step below keeps decoding safely.
-            draft_ids = None
-        else:
-            draft_ids = state.proposer.propose(max_draft=remaining - 1)
-    stats.propose_ms += (time.perf_counter() - t0) * 1000
+    try:
+        logits, gdn_states = _forward(gen_batch, next_main[None, :], capture=True)
+    except TypeError as exc:
+        # Call-time signature rejection: nothing was forwarded, the cache
+        # is untouched — safe to hand the step back to the standard path.
+        _mark_unsupported(gen_batch, f"capture_layer_ids rejected: {exc}")
+        raise _NgramStepFallback("gdn capture probe failed")
+    stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
+    if _gdn_states_usable(gdn_states):
+        state.gdn_verified = True
+    else:
+        # The forward already ran, so finish this step normally; this
+        # request keeps delegating plain steps (gdn_verified stays False)
+        # and future requests skip ngram entirely.
+        _mark_unsupported(gen_batch, "gdn capture probe returned no usable states")
+
+    prev_buf = None
+    if procs is not None:
+        prev_buf = gen_batch._token_context[0].update_and_fetch(next_main)
+
+    t0 = time.perf_counter()
+    step_logits = logits[:, -1, :]
+    step_logits = _apply_processors(procs, prev_buf, step_logits)
+    lp = _logprobs(step_logits)  # (1, vocab)
+    sampled = sampler(lp)
+    mx.async_eval(sampled)
+    stats.sample_ms += (time.perf_counter() - t0) * 1000
+
+    # next_main is now in cache -> emit it; new sample becomes pending.
+    state.queue.append((state.next_main_id, state.next_main_lp, "plain"))
+    state.next_main = _ensure_uint32(sampled)
+    state.next_main_id = -1  # resolved lazily next step
+    state.next_main_lp = lp.squeeze(0)
+
+    gen_batch._next_tokens = state.next_main
+    gen_batch._next_logprobs = [state.next_main_lp]
+
+
+def _run_verify_cycle(
+    gen_batch: Any, state: _NgramState, draft_ids: List[int]
+) -> None:
+    """Verify K draft tokens in one (K+1)-token forward; queue the emits."""
+    import mlx.core as mx
+
+    sampler = _resolve_sampler(gen_batch)
+    procs = _proc_list(gen_batch)
+    stats = state.stats
     capture = state.rollback_mode == "gdn"
 
-    if not draft_ids:
-        # ---- plain 1-token step (with gdn capture probe on first use) ----
-        stats.plain_steps += 1
+    k = len(draft_ids)
+    stats.cycles += 1
+    stats.proposed_tokens += k
 
-        want_probe = capture and not state.gdn_verified
-        t0 = time.perf_counter()
-        try:
-            logits, gdn_states = _forward(
-                gen_batch, state.next_main[None, :], capture=want_probe
+    cycle_t0 = time.perf_counter()
+    draft_arr = mx.array(draft_ids, dtype=mx.uint32)
+    inputs = mx.concatenate([_ensure_uint32(state.next_main), draft_arr])  # (K+1,)
+
+    t0 = time.perf_counter()
+    logits, gdn_states = _forward(gen_batch, inputs[None, :], capture=capture)
+    stats.backbone_ms += (time.perf_counter() - t0) * 1000
+
+    prev_bufs: List[Any] = []
+    if procs is not None:
+        buf = gen_batch._token_context[0]
+        for i in range(k + 1):
+            prev_bufs.append(buf.update_and_fetch(inputs[i : i + 1]))
+
+    t0 = time.perf_counter()
+    pos_logits = logits[0]  # (K+1, vocab)
+    if procs is not None:
+        rows = [
+            _apply_processors(procs, prev_bufs[i], pos_logits[i : i + 1])
+            for i in range(k + 1)
+        ]
+        pos_logits = mx.concatenate(rows, axis=0)
+    lp_all = _logprobs(pos_logits)  # (K+1, vocab)
+    sampled = sampler(lp_all)  # (K+1,)
+    mx.eval(sampled)
+    sampled_ids = [int(x) for x in sampled.tolist()]
+
+    accepted = 0
+    while accepted < k and sampled_ids[accepted] == draft_ids[accepted]:
+        accepted += 1
+    stats.accepted_tokens += accepted
+    stats.sample_ms += (time.perf_counter() - t0) * 1000
+
+    # Adaptive backoff: on workloads where lookups keep missing (freeform
+    # prose), each failed cycle costs a K+1-token forward for one emitted
+    # token. Exponentially suppress proposals after consecutive zero-accept
+    # cycles; any accept resets the streak.
+    if accepted == 0:
+        state.reject_streak += 1
+        if state.reject_streak >= 2:
+            state.skip_until_step = state.step_counter + min(
+                2**state.reject_streak, 512
             )
-        except TypeError as exc:
-            # Call-time signature rejection: nothing was forwarded, the
-            # cache is untouched — safe to hand the step back to the
-            # standard path and disable ngram for this model.
-            if want_probe:
-                _mark_unsupported(gen_batch, f"capture_layer_ids rejected: {exc}")
-                raise _NgramStepFallback("gdn capture probe failed")
-            raise
-        mx.eval(logits)
-        stats.backbone_ms += (time.perf_counter() - t0) * 1000
-
-        if want_probe:
-            if _gdn_states_usable(gdn_states):
-                state.gdn_verified = True
-            else:
-                # The forward already ran, so finish this step normally;
-                # this request keeps plain-stepping (gdn_verified stays
-                # False) and future requests skip ngram entirely.
-                _mark_unsupported(
-                    gen_batch, "gdn capture probe returned no usable states"
-                )
-
-        prev_buf = None
-        if procs is not None:
-            prev_buf = gen_batch._token_context[0].update_and_fetch(state.next_main)
-
-        t0 = time.perf_counter()
-        step_logits = logits[:, -1, :]
-        step_logits = _apply_processors(procs, prev_buf, step_logits)
-        lp = _logprobs(step_logits)  # (1, vocab)
-        sampled = sampler(lp)
-        mx.eval(sampled)
-        new_id = int(sampled.tolist()[0])
-        stats.sample_ms += (time.perf_counter() - t0) * 1000
-
-        # next_main is now in cache -> emit it; new sample becomes pending.
-        state.queue.append((state.next_main_id, state.next_main_lp, "plain"))
-        state.next_main = _ensure_uint32(sampled)
-        state.next_main_id = new_id
-        state.next_main_lp = lp.squeeze(0)
-
-        t0 = time.perf_counter()
-        state.proposer.extend([new_id])
-        stats.propose_ms += (time.perf_counter() - t0) * 1000
     else:
-        # ---- speculative verify ------------------------------------------
-        k = len(draft_ids)
-        stats.cycles += 1
-        stats.proposed_tokens += k
+        state.reject_streak = 0
 
-        draft_arr = mx.array(draft_ids, dtype=mx.uint32)
-        inputs = mx.concatenate([state.next_main, draft_arr])  # (K+1,)
-
-        t0 = time.perf_counter()
-        logits, gdn_states = _forward(gen_batch, inputs[None, :], capture=capture)
-        mx.eval(logits)
-        stats.backbone_ms += (time.perf_counter() - t0) * 1000
-
-        prev_bufs: List[Any] = []
-        if procs is not None:
-            buf = gen_batch._token_context[0]
-            for i in range(k + 1):
-                prev_bufs.append(buf.update_and_fetch(inputs[i : i + 1]))
-
-        t0 = time.perf_counter()
-        pos_logits = logits[0]  # (K+1, vocab)
-        if procs is not None:
-            rows = [
-                _apply_processors(procs, prev_bufs[i], pos_logits[i : i + 1])
-                for i in range(k + 1)
-            ]
-            pos_logits = mx.concatenate(rows, axis=0)
-        lp_all = _logprobs(pos_logits)  # (K+1, vocab)
-        sampled = sampler(lp_all)  # (K+1,)
-        mx.eval(sampled)
-        sampled_ids = [int(x) for x in sampled.tolist()]
-
-        accepted = 0
-        while accepted < k and sampled_ids[accepted] == draft_ids[accepted]:
-            accepted += 1
-        stats.accepted_tokens += accepted
-        stats.sample_ms += (time.perf_counter() - t0) * 1000
-
-        # ---- rollback rejected positions ---------------------------------
-        n_trim = k - accepted
-        t0 = time.perf_counter()
-        if n_trim > 0:
-            if state.rollback_mode == "gdn":
-                if not _gdn_states_usable(gdn_states):
-                    # Probe verified capture works, so this is unexpected —
-                    # and the cache now holds unremovable rejected tokens.
-                    # Surface loudly instead of continuing corrupted.
-                    raise RuntimeError(
-                        "ngram verify forward returned no gdn states; "
-                        "cache cannot be rolled back"
-                    )
-                target = _resolve_rollback_target(gen_batch.model)
-                target.rollback_speculative_cache(
-                    gen_batch.prompt_cache,
-                    gdn_states,
-                    accepted,
-                    k + 1,
+    # ---- rollback rejected positions --------------------------------------
+    n_trim = k - accepted
+    t0 = time.perf_counter()
+    if n_trim > 0:
+        if state.rollback_mode == "gdn":
+            if not _gdn_states_usable(gdn_states):
+                # Probe verified capture works, so this is unexpected —
+                # and the cache now holds unremovable rejected tokens.
+                # Surface loudly instead of continuing corrupted.
+                raise RuntimeError(
+                    "ngram verify forward returned no gdn states; "
+                    "cache cannot be rolled back"
                 )
-            else:
-                for c in gen_batch.prompt_cache:
-                    c.trim(n_trim)
-            if procs is not None:
-                _trim_token_buffer(gen_batch, n_trim)
-        stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+            target = _resolve_rollback_target(gen_batch.model)
+            target.rollback_speculative_cache(
+                gen_batch.prompt_cache,
+                gdn_states,
+                accepted,
+                k + 1,
+            )
+        else:
+            for c in gen_batch.prompt_cache:
+                c.trim(n_trim)
+        if procs is not None:
+            _trim_token_buffer(gen_batch, n_trim)
+    stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
 
-        # ---- queue emits: next_main + accepted drafts (all in cache) -----
-        state.queue.append((state.next_main_id, state.next_main_lp, "plain"))
-        for i in range(accepted):
-            state.queue.append((draft_ids[i], lp_all[i], "draft"))
+    # ---- cycle economics ---------------------------------------------------
+    # The mx.eval above waited for the full verify forward, so this wall
+    # time is a fair per-cycle cost. When the measured cost per emitted
+    # token exceeds the plain-step cost (compute-bound hardware, mid
+    # acceptance rates), suppress speculation for a long window and
+    # re-probe afterwards.
+    cycle_ms = (time.perf_counter() - cycle_t0) * 1000
+    tokens_gained = float(accepted + 1)
+    if state.ema_cycle_ms is None:
+        state.ema_cycle_ms = cycle_ms
+        state.ema_cycle_tokens = tokens_gained
+    else:
+        state.ema_cycle_ms = 0.7 * state.ema_cycle_ms + 0.3 * cycle_ms
+        state.ema_cycle_tokens = (
+            0.7 * state.ema_cycle_tokens + 0.3 * tokens_gained
+        )
+    if (
+        stats.cycles >= 4
+        and state.plain_samples >= 6
+        and state.ema_plain_ms is not None
+        and state.ema_cycle_ms / max(state.ema_cycle_tokens, 1e-9)
+        > state.ema_plain_ms * 1.15
+    ):
+        state.econ_strikes += 1
+        if state.econ_strikes >= 2:
+            state.speculation_disabled = True
+        else:
+            state.skip_until_step = max(
+                state.skip_until_step, state.step_counter + 64
+            )
 
-        # The sample at the first mismatch (or the bonus position when all
-        # drafts were accepted) becomes the new pending token.
-        bonus_id = sampled_ids[accepted]
-        state.next_main = _ensure_uint32(sampled[accepted : accepted + 1])
-        state.next_main_id = bonus_id
-        state.next_main_lp = lp_all[accepted]
+    # ---- queue emits: next_main + accepted drafts (all in cache) ----------
+    state.queue.append((state.next_main_id, state.next_main_lp, "plain"))
+    for i in range(accepted):
+        state.queue.append((draft_ids[i], lp_all[i], "draft"))
 
-        t0 = time.perf_counter()
-        state.proposer.extend(list(draft_ids[:accepted]) + [bonus_id])
-        stats.propose_ms += (time.perf_counter() - t0) * 1000
+    # The sample at the first mismatch (or the bonus position when all
+    # drafts were accepted) becomes the new pending token.
+    bonus_id = sampled_ids[accepted]
+    state.next_main = _ensure_uint32(sampled[accepted : accepted + 1])
+    state.next_main_id = bonus_id
+    state.next_main_lp = lp_all[accepted]
 
     # Keep the stock fields pointing at the pending sample so a queue-empty
     # reshape needs no reconcile work at all.
@@ -781,6 +939,7 @@ def _emit_response(
     Response = type(gen_batch).Response
 
     finish_reason: Optional[str] = None
+    state.proposer.extend([token_id])
     gen_batch.tokens[0].append(token_id)
     gen_batch._num_tokens[0] += 1
     if gen_batch._num_tokens[0] >= gen_batch.max_tokens[0]:

@@ -65,9 +65,13 @@ class NgramProposer:
     def __init__(self, config: NgramSpecConfig):
         self._config = config
         self._tokens: List[int] = []
-        # n-gram tuple -> end position (exclusive) of its latest occurrence
-        # that has at least one continuation token.
-        self._index: Dict[Tuple[int, ...], int] = {}
+        # n-gram tuple -> [first_end, latest_end] (end positions, exclusive)
+        # of occurrences that have at least one continuation token. The
+        # latest occurrence is preferred (adapts to local text), but when
+        # its continuation is too short — typical inside a repeating tail,
+        # where the latest match sits at the very end of the stream — the
+        # first occurrence provides the long continuation instead.
+        self._index: Dict[Tuple[int, ...], List[int]] = {}
         # Highest end position already indexed (exclusive position value).
         self._indexed_end = 0
 
@@ -91,7 +95,12 @@ class NgramProposer:
             for n in range(min_n, max_n + 1):
                 if n > e:
                     break
-                self._index[tuple(tokens[e - n : e])] = e
+                key = tuple(tokens[e - n : e])
+                entry = self._index.get(key)
+                if entry is None:
+                    self._index[key] = [e, e]
+                else:
+                    entry[1] = e
         if limit > self._indexed_end:
             self._indexed_end = limit
 
@@ -111,10 +120,15 @@ class NgramProposer:
         for n in range(self._config.max_n, self._config.min_n - 1, -1):
             if length < n:
                 continue
-            end = self._index.get(tuple(tokens[length - n : length]))
-            if end is None:
+            entry = self._index.get(tuple(tokens[length - n : length]))
+            if entry is None:
                 continue
-            draft = tokens[end : end + cap]
+            first_end, latest_end = entry
+            draft = tokens[latest_end : latest_end + cap]
+            if len(draft) < min(2, cap) and first_end != latest_end:
+                # Latest match sits at the stream's tail (short continuation);
+                # the first occurrence carries the long continuation.
+                draft = tokens[first_end : first_end + cap]
             if draft:
                 return list(draft)
         return None

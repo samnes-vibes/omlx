@@ -117,13 +117,35 @@ SCENARIOS = {
 # ---------------------------------------------------------------------------
 
 
+_ADMIN_COOKIE = {"value": None}
+
+
 def _request(url, payload=None, method=None, token=None, timeout=600):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
+    if "/admin/" in url and _ADMIN_COOKIE["value"]:
+        req.add_header("Cookie", f"omlx_admin_session={_ADMIN_COOKIE['value']}")
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+def admin_login(base_url, api_key):
+    """Fetch an admin session cookie via /admin/auto-login?key=..."""
+    import http.cookiejar
+
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    try:
+        opener.open(f"{base_url}/admin/auto-login?key={api_key}", timeout=30)
+    except urllib.error.HTTPError:
+        pass
+    for cookie in jar:
+        if cookie.name == "omlx_admin_session":
+            _ADMIN_COOKIE["value"] = cookie.value
+            return True
+    return False
 
 
 def _get_json(url, token=None):
@@ -219,11 +241,13 @@ def fetch_ngram_stats(base_url, token=None, reset=False):
 
 def set_ngram_enabled(base_url, model, enabled, token=None):
     """Flip ngram_spec_enabled via the admin API (auto-reloads loaded models)."""
-    result = _post_json(
+    with _request(
         f"{base_url}/admin/api/models/{model}/settings",
-        {"ngram_spec_enabled": bool(enabled)},
+        payload={"ngram_spec_enabled": bool(enabled)},
+        method="PUT",
         token=token,
-    )
+    ) as resp:
+        result = json.loads(resp.read())
     if result.get("requires_reload") and not (
         result.get("auto_reloaded") or not result.get("auto_unloaded")
     ):
@@ -296,7 +320,11 @@ def main():
     )
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=1)
-    ap.add_argument("--admin-token", default=None)
+    ap.add_argument(
+        "--api-key",
+        default=None,
+        help="oMLX API key; used as Bearer for /v1 and for admin auto-login",
+    )
     ap.add_argument(
         "--ab",
         action="store_true",
@@ -306,7 +334,10 @@ def main():
     args = ap.parse_args()
 
     scenarios = args.scenario or sorted(SCENARIOS)
-    token = args.admin_token
+    token = args.api_key
+    if token and not admin_login(args.base_url, token):
+        print("warning: admin auto-login failed; admin API calls may 401",
+              file=sys.stderr)
 
     try:
         _get_json(f"{args.base_url}/v1/models", token=token)

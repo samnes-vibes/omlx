@@ -84,6 +84,16 @@ class TestPropose:
         assert inc.propose() == bulk.propose()
         assert inc._index == bulk._index
 
+    def test_repeating_tail_falls_back_to_first_occurrence(self):
+        # In a constant run the latest suffix match sits at the stream's
+        # end (1-token continuation); the first occurrence must provide a
+        # full-length draft so the check-token + drafts split still works.
+        p = make(min_n=1, max_n=4, max_draft=8)
+        p.extend([9] * 30)
+        out = p.propose()
+        assert out is not None and len(out) >= 2
+        assert all(t == 9 for t in out)
+
     def test_extend_in_chunks_matches_bulk(self):
         tokens = list(range(10)) + [3, 4, 5, 6] + list(range(10))
         bulk = make(tokens=tokens)
