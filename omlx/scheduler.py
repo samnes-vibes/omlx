@@ -1490,6 +1490,7 @@ class Scheduler:
         # it enabled; see docs/experimental/cacheblend_plan.md Phase 3).
         self._chunk_kv_reuse_enabled: bool = False
         self._chunk_kv_recompute_pct: float = 0.15
+        self._chunk_kv_min_chunk_tokens: int = 256
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
@@ -1995,6 +1996,7 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
+        message_token_offsets: list[int] | None = None,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -2049,6 +2051,8 @@ class Scheduler:
                         extra_keys=extra_keys,
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
+                        message_token_offsets=message_token_offsets,
+                        message_chunk_min_tokens=self._chunk_kv_min_chunk_tokens,
                     )
                 else:
                     block_table = self.block_aware_cache.store_cache(
@@ -2061,6 +2065,8 @@ class Scheduler:
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
                         hot_cache_write_back=False,
+                        message_token_offsets=message_token_offsets,
+                        message_chunk_min_tokens=self._chunk_kv_min_chunk_tokens,
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -3272,8 +3278,25 @@ class Scheduler:
             last_token = tokens[-1:]
 
             block_size = self.config.paged_cache_block_size or 256
+
+            # Message-boundary chunking (when the request carries offsets):
+            # aligns lookup chunks with the message-aligned content chunks
+            # the store path saves, so shared content hits regardless of
+            # its fixed-block phase. Offsets are absolute in the prompt;
+            # `tokens` may be the prefix-cache-trimmed remainder, so shift
+            # them onto the remainder's coordinates first.
+            msg_offsets = getattr(request, "message_token_offsets", None)
+            relative_offsets = None
+            if msg_offsets and request.prompt_token_ids:
+                base = len(request.prompt_token_ids) - len(tokens)
+                if base >= 0:
+                    relative_offsets = [o - base for o in msg_offsets if o > base]
+
             chunk_hits = chunks_with_manager_hits(
-                prefill_tokens, self.paged_ssd_cache_manager, block_size
+                prefill_tokens,
+                self.paged_ssd_cache_manager,
+                block_size,
+                message_token_offsets=relative_offsets,
             )
             hit_count = sum(1 for _, hit in chunk_hits if hit is not None)
             if hit_count == 0:
@@ -8828,6 +8851,11 @@ class Scheduler:
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
                                         hot_cache_write_back,
+                                        (
+                                            request.message_token_offsets
+                                            if self._chunk_kv_reuse_enabled
+                                            else None
+                                        ),
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -8858,6 +8886,11 @@ class Scheduler:
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
                                     hot_cache_write_back,
+                                    (
+                                        request.message_token_offsets
+                                        if self._chunk_kv_reuse_enabled
+                                        else None
+                                    ),
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "

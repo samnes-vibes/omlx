@@ -122,8 +122,9 @@ Key design decisions:
 ### Phase 1 — chunk store (no behavior change)
 
 - [x] Chunker: `omlx/cache/kv_reuse.py::chunk_tokens` — message-boundary split when
-      `message_token_offsets` is supplied (not yet plumbed from `omlx/request.py` / API
-      layer — that wiring is Phase 2/3 work once a load path exists to consume it),
+      `message_token_offsets` is supplied (plumbed 2026-07-07 from the engine chat
+      layer through `Request.message_token_offsets`; see the Phase 3 measurement
+      entry's "message-boundary chunking plumbed end to end"),
       fixed-size (`min_chunk_tokens`, default 256) fallback otherwise. Unit tests in
       `tests/test_kv_reuse.py`: determinism, boundary stability under trailing appends,
       and the edited-middle-message case (chunks before an edit stay byte-identical;
@@ -265,6 +266,127 @@ the chunked state machine is future work (see below).
       admin/api/kv-reuse/stats`), which is a benchmarking session, not something achievable
       inside this coding session. This is the one item standing between "code complete" and
       "safe to enable by default."
+      **Attempted 2026-07-07:** started a live server (`omlx serve --paged-ssd-cache-dir
+      ...`) against the two models already present in the local HF cache —
+      `mlx-community/Qwen3.5-0.8B-MLX-4bit` and `mlx-community/gemma-4-e2b-it-4bit` — and
+      both are ineligible before any A/B is meaningful, though **not because they're
+      VLM-tagged** (that was an initial misdiagnosis, corrected same day): the
+      `Scheduler._do_prefill_with_chunk_reuse` VLM early-out only fires when a request
+      actually carries image/video embeds (`request.vlm_inputs_embeds is not None`) — a
+      text-only chat request to either model would sail past that check. The real
+      blocker is `is_chunk_reuse_eligible()` (`omlx/cache/kv_reuse.py:456`), which
+      requires every layer's cache object to be a plain `"KVCache"`:
+      - Qwen3.5's `config.json` shows hybrid `layer_types` (periodic `linear_attention`
+        layers, `full_attention_interval: 4`) → non-`KVCache` cache class for those
+        layers.
+      - Gemma-4's `text_config.layer_types` is mostly `sliding_attention` with occasional
+        `full_attention` → `RotatingKVCache`-family layers.
+      Both fail the plain-KVCache check by design (this is the documented "Rotating/
+      window caches ... excluded in v1" non-goal, working as intended, not a new gap).
+      Broader implication: this isn't a multimodality problem, it's an attention-
+      architecture problem — sliding-window and hybrid-linear-attention models (which
+      skew towards the same small/efficient models people run locally, and often
+      happen to be multimodal too, hence the original mix-up) are out of scope for v1
+      regardless of the VLM flag. Plain dense-attention causal LMs (Llama, Mistral, most
+      Qwen2/3-dense, Phi) remain eligible. Conclusion: the quality gate still needs a
+      plain text-only, pure-RoPE, dense-attention causal LM (e.g. a
+      Llama-3.2-Instruct-4bit-class model) downloaded specifically for this measurement —
+      neither model already on disk works. Still blocked; no fidelity numbers exist yet.
+      **Measured 2026-07-07** on `mlx-community/Llama-3.2-1B-Instruct-4bit` (dense
+      attention, plain `KVCache` all 16 layers — eligible, confirming the model-class
+      analysis above). Two-part result:
+      1. **`perf_bench.py --ab` measures nothing for this feature: 0 hits across all 4
+         scenarios, empty stats, TTFT unchanged.** Two independent root causes, both
+         real findings, not harness bugs:
+         - **`content_hash` is never persisted.** `save_block` computes it and sets it
+           on the in-RAM `PagedSSDBlockMetadata`, but the safetensors file-metadata dict
+           (`paged_ssd_cache.py`, the `metadata = {...}` block in `save_block`) omits
+           `content_hash`/`content_position`, so `_scan_existing_files` →
+           `_read_file_metadata` rebuilds the index without them after every model
+           reload. Since flipping the setting auto-unloads/reloads the model, the `--ab`
+           flow structurally cannot see cross-pass hits. (Verified: blocks on disk from
+           the OFF pass have no `content_hash` key in their metadata.) Fix: add the two
+           fields to the file metadata dict — `to_dict`/`from_dict` on the metadata
+           class already handle them.
+           **Fixed 2026-07-07:** both fields now written in `save_block`'s file
+           metadata and parsed back in `_read_file_metadata` (hex round-trip,
+           tolerant of missing/garbled values). Regression test
+           `tests/test_paged_ssd_cache.py::TestPagedSSDCacheManagerWithMLX::
+           test_content_hash_survives_index_rescan` (save → fresh manager over the
+           same dir → `find_content_hash_hit` still hits; verified to fail without
+           the fix).
+         - **Block-alignment sensitivity.** Lookup chunks the new prompt at fixed
+           `paged_cache_block_size` (256) boundaries from token 0; a stored block only
+           hits if the shared content sits at the *same* 256-token phase in both
+           prompts. Natural-text permutations (the bench scenarios, and real RAG
+           prompts) essentially never satisfy this, so hits require either
+           block-aligned chunk padding or the planned message-boundary chunking
+           (`message_token_offsets`, still unplumbed).
+           **Fixed 2026-07-07 — message-boundary chunking plumbed end to end:**
+           - *Offsets computed at the chat layer:*
+             `BatchedEngine._compute_message_token_offsets` renders each
+             `messages[:i]` prefix with the same template kwargs (minus the
+             generation prompt) and double-validates every boundary — the rendered
+             prefix must be a **string** prefix of the full prompt AND its token
+             ids a **token** prefix of the full prompt's ids (BPE merges across a
+             boundary would otherwise misalign the offset silently). Invalid
+             boundaries are dropped, not guessed. Only computed when
+             `chunk_kv_reuse_enabled` (it costs one full-prompt encode plus a
+             render+encode per message); wired in both `chat()` and
+             `stream_chat()`.
+           - *Plumbing:* new `Request.message_token_offsets` field, carried through
+             `BatchedEngine.generate`/`stream_generate` →
+             `AsyncEngineCore.add_request` → `Request`.
+           - *Store side:* `BlockAwarePrefixCache._store_message_content_chunks`
+             (called from `store_cache` when offsets are passed, which the
+             scheduler's `_async_store_cache_worker` only does when the feature is
+             on) saves each message-aligned chunk as its OWN content-addressed SSD
+             entry keyed by `kv_reuse.content_chunk_block_hash` (domain-separated
+             from prefix-chain hashes; identical content dedupes via the existing
+             has-block short-circuit). Guards: plain-KVCache stacks only, chunk KV
+             fully present in the extracted cache (`_get_cache_seq_len`), and
+             chunks shorter than `chunk_kv_min_chunk_tokens` skipped (propagated to
+             the scheduler as `_chunk_kv_min_chunk_tokens`). The per-physical-block
+             content hashes from Phase 1 still get written — aligned prompts can
+             still hit them — but message chunks are what real prompts hit.
+           - *Lookup side:* `_do_prefill_with_chunk_reuse` shifts the request's
+             absolute offsets onto the prefix-cache-trimmed remainder's coordinates
+             (dropping boundaries inside the cached prefix) and passes them to
+             `chunks_with_manager_hits`, which now chunks at message boundaries
+             when offsets are given, fixed block size otherwise.
+           - *Bug found & fixed while wiring:* `_splice_reuse_step` applied the
+             plan-relative `rope_delta` directly, ignoring the restored prefix
+             length when `existing_cache` came from a prefix-cache hit — every
+             spliced K under-shifted by exactly the cached-prefix token count.
+             (Invisible in the earlier fidelity probe because those requests were
+             built to defeat the prefix cache, so base offset was always 0.)
+             `execute_chunk_prefill_plan` now captures the cache's entry offset and
+             folds it into the splice delta; covered by
+             `test_reuse_splice_folds_restored_prefix_into_rope_delta`.
+           - *Tests:* `tests/test_kv_reuse.py` (`TestContentChunkBlockHash`,
+             message-offset cases in `TestChunksWithManagerHits`,
+             `TestStoreMessageContentChunks` — store→lookup round-trip at a
+             different position, min-tokens filter, non-KVCache refusal, seq-len
+             guard, dedupe), `tests/test_batched_engine.py::
+             TestComputeMessageTokenOffsets` (offset correctness, non-prefix
+             template render dropped, tokenizer-error safety),
+             `tests/test_scheduler.py::TestChunkKVReusePrefillDispatch::
+             test_message_offsets_translated_to_remainder_coordinates`. Full suite
+             green (6225 passed).
+      2. **With block-aligned prompts (controlled test, same session, no reload),
+         the full pipeline works end-to-end.** Synthetic 1281-token prompts = 255-token
+         head + 4×256-token content chunks, permuted between requests with differing
+         heads (prefix cache defeated). Reuse fired: 4/5 chunks hit per request,
+         ~868 tokens spliced vs ~170 forwarded per request at recompute_pct=0.15.
+         **Fidelity: 4/4 extractive-QA outputs byte-identical to feature-off at
+         temp=0** (small probe, but the ≥95% answer-match bar is met at 100% on it).
+         **Perf on this 1B model: reuse is a net loss** — ~830–1080 ms wall vs
+         ~420–490 ms plain warm prefill for the same ~1280-token prompts. SSD load +
+         RoPE shift + several small per-span forwards lose to one fast dense prefill
+         at this model size, exactly the "Load+shift slower than recompute on
+         fast-prefill models / short chunks" risk. The Phase 4 min-prompt/min-model
+         auto-disable threshold is not optional; benefit needs re-measuring on a
+         larger model and longer prompts.
 - [ ] Concurrency: recompute forwards go through the same chunked-prefill scheduling as
       normal prefill so decode of other requests is not starved. **Not done** — v1's scoping
       decision (single-shot external-prefill path only, see above) means chunk reuse never
@@ -275,10 +397,17 @@ the chunked state machine is future work (see below).
 
 **What's NOT done yet, concretely:**
 1. Live-model quality/perf measurement (the item above) — everything else is unblocked by
-   this, but the feature should stay off by default until it's measured.
+   this, but the feature should stay off by default until it's measured. With the
+   2026-07-07 fixes (content-hash persistence + message-boundary chunking) the
+   `perf_bench.py --ab` flow should now actually produce hits on the natural-text
+   scenarios; re-run it on a dense-attention model (Llama-3.2-class) as the next
+   session's first step.
 2. Chunk reuse for very long prompts that go through the multi-step chunked-prefill state
    machine (only single-shot external-prefill-eligible prompts benefit today).
 3. Non-English i18n strings for the new admin toggle.
+4. Message-chunk store writes are per-request extra SSD volume (each qualifying
+   message chunk becomes its own block file, deduped by content). No budget
+   pressure expected under the shared LRU, but worth watching in the live run.
 
 ### Phase 4 — tuning & results
 
@@ -314,13 +443,15 @@ the chunked state machine is future work (see below).
 
 | File | Change |
 |---|---|
-| `omlx/cache/kv_reuse.py` | chunker, content-hash index glue, RoPE shift, recompute-set selection; Phase 3: `execute_chunk_prefill_plan`/`_splice_reuse_step`, `is_chunk_reuse_eligible`, `chunks_with_manager_hits`, stats accumulator; `rope_delta` bug fix |
-| `omlx/cache/paged_ssd_cache.py` | `content_hash` metadata field + secondary index; Phase 3: `find_content_hash_hit` |
-| `omlx/cache/prefix_cache.py` | store-path hook (write chunk entries) — fetch-path arbitration lives in `scheduler.py`, not here (see below) |
+| `omlx/cache/kv_reuse.py` | chunker, content-hash index glue, RoPE shift, recompute-set selection; Phase 3: `execute_chunk_prefill_plan`/`_splice_reuse_step`, `is_chunk_reuse_eligible`, `chunks_with_manager_hits` (+ message-offset mode), stats accumulator; `rope_delta` bug fix; `content_chunk_block_hash`; base-offset fold into splice delta |
+| `omlx/cache/paged_ssd_cache.py` | `content_hash` metadata field + secondary index; Phase 3: `find_content_hash_hit`; persistence fix: `content_hash`/`content_position` written to + read from safetensors file metadata |
+| `omlx/cache/prefix_cache.py` | store-path hook (write chunk entries) — fetch-path arbitration lives in `scheduler.py`, not here (see below); `_store_message_content_chunks` + `store_cache(message_token_offsets=…)` |
+| `omlx/request.py` | `Request.message_token_offsets` field |
+| `omlx/engine_core.py` | `add_request(message_token_offsets=…)` → `Request` |
 | `omlx/patches/specprefill.py` | none — imported (`manual_rope_with_freqs`, `_find_attention_layers`, `_get_attn_module`, position-mapped RoPE helpers) |
 | `omlx/model_settings.py` | `chunk_kv_*` settings + compatibility validation |
 | `omlx/scheduler.py` | Phase 3: `_do_prefill_with_chunk_reuse` (new method, after `_do_external_prefill`), dispatch branch at the "Normal (non-chunked) full prefill path" call site, `_chunk_kv_reuse_enabled`/`_chunk_kv_recompute_pct` scheduler attrs |
-| `omlx/engine/batched.py` | Phase 3: propagate `chunk_kv_reuse_enabled`/`chunk_kv_recompute_pct` from model_settings to the scheduler at engine start |
+| `omlx/engine/batched.py` | Phase 3: propagate `chunk_kv_reuse_enabled`/`chunk_kv_recompute_pct`/`chunk_kv_min_chunk_tokens` from model_settings to the scheduler at engine start; `_compute_message_token_offsets` + wiring in `chat()`/`stream_chat()`/`generate()`/`stream_generate()` |
 | `omlx/admin/routes.py` | Phase 3: `ModelSettingsRequest` fields, validation/conflict glue, requires-reload entries, diffusion/VLM reset paths, `GET /api/kv-reuse/stats` |
 | `omlx/admin/templates/dashboard/_modal_model_settings.html`, `omlx/admin/static/js/dashboard.js`, `omlx/admin/i18n/en.json` | Phase 3: toggle UI + field wiring + strings |
 | `scripts/perf_bench.py` | RAG/agent/multi-turn/prefix-control scenarios already added (Phase 0); not yet pointed at `chunk_kv_reuse_enabled`/`/api/kv-reuse/stats` for a real run |

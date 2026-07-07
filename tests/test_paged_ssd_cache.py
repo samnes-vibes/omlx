@@ -831,6 +831,68 @@ class TestPagedSSDCacheManagerWithMLX:
         _, file_metadata = mx.load(str(file_path), return_metadata=True)
         assert file_metadata.get("omlx_cache_format_version") == _CACHE_FORMAT_VERSION
 
+    def test_content_hash_survives_index_rescan(self, tmp_path: Path, mock_mlx):
+        """content_hash/content_position persist through a file-scan rebuild.
+
+        Regression: save_block set content_hash only on the in-RAM metadata,
+        not in the safetensors file metadata, so every restart/model reload
+        (_scan_existing_files -> _read_file_metadata) silently dropped the
+        content index — chunk-KV reuse could never hit across reloads.
+        """
+        import time as time_mod
+
+        mx = mock_mlx
+
+        cache_dir = tmp_path / "ssd_cache"
+        # find_content_hash_hit derives the lookup hash from the manager's
+        # expected-compat attributes, so set them the way a real model load
+        # does — for both managers, since the rescanned one must recompute
+        # the same hash the file was saved under.
+        manager_kwargs = dict(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="test-model",
+            expected_num_layers=1,
+            expected_block_size=32,
+            expected_layer_cache_types=["KVCache"],
+        )
+        manager = PagedSSDCacheManager(**manager_kwargs)
+
+        block_hash = b"content_rescan_hash1"
+        token_ids = list(range(100, 132))
+        cache_data = [(mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))]
+
+        assert manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=32,
+            model_name="test-model",
+            layer_cache_types=["KVCache"],
+            content_token_ids=token_ids,
+            content_position=512,
+        )
+        # Sanity: hit exists in the live manager's index before any rescan.
+        live_hit = manager.find_content_hash_hit(token_ids)
+        assert live_hit is not None
+        assert live_hit.content_position == 512
+
+        # Wait for the background writer to flush the file to disk.
+        file_path = manager._get_file_path(block_hash)
+        for _ in range(50):
+            if file_path.exists():
+                break
+            time_mod.sleep(0.1)
+        assert file_path.exists(), "background writer never produced the file"
+
+        # A fresh manager over the same dir rebuilds its index purely from
+        # file metadata — this is what happens on every model reload.
+        rescanned = PagedSSDCacheManager(**manager_kwargs)
+
+        hit = rescanned.find_content_hash_hit(token_ids)
+        assert hit is not None, "content_hash lost in file-scan index rebuild"
+        assert hit.block_hash == block_hash
+        assert hit.content_position == 512
+
     def test_unversioned_block_is_rejected_at_index_scan(
         self, tmp_path: Path, mock_mlx
     ):

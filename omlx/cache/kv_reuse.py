@@ -422,19 +422,52 @@ def count_potential_hits(chunks: Sequence[Chunk], ssd_index) -> tuple[int, int]:
     return would_hit, len(chunks)
 
 
+def content_chunk_block_hash(token_ids: Sequence[int], model_name: str = "") -> bytes:
+    """
+    Block hash under which a message-aligned content chunk's KV is stored
+    as its own entry in the paged SSD store.
+
+    Content chunks don't correspond to any prefix-chain block, so they need
+    a `block_hash` of their own to key the safetensors file. Deriving it
+    from (model_name, token_ids) makes saves of identical content naturally
+    dedupe through `save_block`'s existing has-block short-circuit, and the
+    distinct domain prefix keeps it from ever colliding with a
+    `paged_cache.compute_block_hash` prefix-chain hash. Lookup never goes
+    through this hash — it uses the content-hash secondary index — so the
+    cache signature is deliberately not part of it (compat is still enforced
+    at load time by the block's stored `cache_signature`).
+    """
+    hasher = hashlib.sha256()
+    hasher.update(b"omlx-content-chunk\x00")
+    hasher.update(model_name.encode("utf-8"))
+    hasher.update(b"\x00")
+    hasher.update(str(tuple(int(t) for t in token_ids)).encode("utf-8"))
+    return hasher.digest()
+
+
 def chunks_with_manager_hits(
-    tokens: Sequence[int], ssd_manager: Any, block_size: int
+    tokens: Sequence[int],
+    ssd_manager: Any,
+    block_size: int,
+    message_token_offsets: Sequence[int] | None = None,
 ) -> list[tuple[Chunk, Any | None]]:
     """
-    Chunk `tokens` at the SSD cache's own block granularity and pair each
-    chunk with a content-hash hit looked up through `ssd_manager`.
+    Chunk `tokens` and pair each chunk with a content-hash hit looked up
+    through `ssd_manager`.
 
-    This chunks at `block_size` (the paged-cache block size the SSD store
-    actually saves under -- `PagedSSDCacheManager.save_block`'s
-    `content_position`/`content_hash` are computed per physical block), NOT
-    `chunk_kv_min_chunk_tokens`: content hashes are block-scoped, so looking
-    up hits at any other chunk granularity would simply never match anything
-    that was ever stored.
+    Chunk boundaries must match how content hashes were computed at store
+    time, or the lookup never matches anything ever stored. Two granularities
+    exist on the store side, hence two here:
+
+      - `message_token_offsets` given: message-boundary chunks, matching the
+        message-aligned content chunks `BlockAwarePrefixCache.store_cache`
+        saves via `content_chunk_block_hash` when a request carries offsets.
+        This is what makes hits happen on real prompts, where shared content
+        almost never sits at the same fixed-block phase in two prompts.
+      - Otherwise: fixed `block_size` chunks (the paged-cache block size the
+        SSD store saves under -- `PagedSSDCacheManager.save_block`'s
+        `content_position`/`content_hash` are computed per physical block),
+        NOT `chunk_kv_min_chunk_tokens`, which would never match anything.
 
     Args:
         tokens: Token span to chunk and probe (e.g. the prefix-cache-trimmed
@@ -445,11 +478,17 @@ def chunks_with_manager_hits(
             model/cache-signature expectations -- callers never need to
             supply `model_name`/`cache_signature` themselves).
         block_size: SSD paged-cache block size (`config.paged_cache_block_size`).
+        message_token_offsets: Chunk-start offsets RELATIVE TO `tokens` (the
+            caller must already have subtracted any prefix-cache-trimmed
+            base), or None for fixed-block chunking.
 
     Returns:
         List of (chunk, hit_metadata_or_None) pairs, in prompt order.
     """
-    chunks = chunk_tokens(tokens, min_chunk_tokens=block_size)
+    if message_token_offsets is not None:
+        chunks = chunk_tokens(tokens, message_token_offsets=message_token_offsets)
+    else:
+        chunks = chunk_tokens(tokens, min_chunk_tokens=block_size)
     return [(c, ssd_manager.find_content_hash_hit(list(c.token_ids))) for c in chunks]
 
 
@@ -510,10 +549,18 @@ def execute_chunk_prefill_plan(
         raise RuntimeError("execute_chunk_prefill_plan requires mlx, which is not installed")
 
     attn_layers = _find_attention_layers(model)
+    # Plan positions (`ChunkPrefillStep.position_start`) are relative to the
+    # token span the plan was built over, but when a prefix-cache-restored
+    # cache is passed in, the span's real positions start at the cache's
+    # current offset, not 0. Forward-pass steps pick that up automatically
+    # (the model reads positions from the cache offset); reuse splices must
+    # fold it into the RoPE delta explicitly or every spliced K lands
+    # under-shifted by exactly the restored prefix length.
+    base_offset = int(cache[attn_layers[0][0]].offset) if attn_layers else 0
     forwarded = 0
     for step in steps:
         if step.kind == "reuse":
-            _splice_reuse_step(cache, step, ssd_manager, attn_layers)
+            _splice_reuse_step(cache, step, ssd_manager, attn_layers, base_offset)
         else:
             token_arr = mx.array(step.token_ids)[None]
             model(token_arr, cache=cache)
@@ -527,8 +574,14 @@ def _splice_reuse_step(
     step: ChunkPrefillStep,
     ssd_manager: Any,
     attn_layers: list[tuple[int, Any]],
+    base_offset: int = 0,
 ) -> None:
-    """Load, shift, and splice one "reuse" step's KV onto `cache` in place."""
+    """Load, shift, and splice one "reuse" step's KV onto `cache` in place.
+
+    `base_offset` is the cache's offset at plan-execution start (the restored
+    prefix length); see `execute_chunk_prefill_plan` for why it must be added
+    to the plan-relative `rope_delta`.
+    """
     block_data = ssd_manager.load_block(step.stored_block_hash)
     if block_data is None:
         raise RuntimeError(
@@ -536,7 +589,7 @@ def _splice_reuse_step(
             f"{step.stored_block_hash.hex()[:16] if step.stored_block_hash else '?'} "
             "was evicted between planning and execution"
         )
-    delta = step.rope_delta
+    delta = step.rope_delta + base_offset
     span_start, span_end = step.token_start, step.token_end
     for layer_idx, layer in attn_layers:
         attn = _get_attn_module(layer)

@@ -16,6 +16,7 @@ from omlx.cache.kv_reuse import (
     chunks_with_hits,
     chunks_with_manager_hits,
     compute_content_hash,
+    content_chunk_block_hash,
     count_potential_hits,
     execute_chunk_prefill_plan,
     is_chunk_reuse_eligible,
@@ -643,6 +644,54 @@ class TestChunksWithManagerHits:
         assert pairs[0][1] is hit
         assert pairs[1][1] is None
 
+    def test_message_offsets_override_block_chunking(self):
+        tokens = list(range(20))
+        # Stored as a message-aligned chunk [3:17) — a block-size lookup
+        # (10) could never produce this span.
+        hit = object()
+        manager = self._FakeManager({tuple(tokens[3:17]): hit})
+        pairs = chunks_with_manager_hits(
+            tokens, manager, block_size=10, message_token_offsets=[3, 17]
+        )
+        assert [(c.start, c.end) for c, _ in pairs] == [(0, 3), (3, 17), (17, 20)]
+        assert pairs[1][1] is hit
+        assert pairs[0][1] is None and pairs[2][1] is None
+
+    def test_empty_message_offsets_yield_single_chunk(self):
+        # All boundaries trimmed away by the prefix cache -> the remainder
+        # is probed as one whole chunk, not re-chunked at block size.
+        tokens = list(range(20))
+        manager = self._FakeManager({})
+        pairs = chunks_with_manager_hits(
+            tokens, manager, block_size=10, message_token_offsets=[]
+        )
+        assert [(c.start, c.end) for c, _ in pairs] == [(0, 20)]
+
+
+class TestContentChunkBlockHash:
+    def test_deterministic(self):
+        assert content_chunk_block_hash([1, 2, 3], "m") == content_chunk_block_hash(
+            [1, 2, 3], "m"
+        )
+
+    def test_varies_by_tokens_and_model(self):
+        h = content_chunk_block_hash([1, 2, 3], "m")
+        assert content_chunk_block_hash([1, 2, 4], "m") != h
+        assert content_chunk_block_hash([1, 2, 3], "other") != h
+
+    def test_domain_separated_from_content_hash(self):
+        # Same inputs must not collide with the content-hash domain: these
+        # key different index namespaces in the same store.
+        assert content_chunk_block_hash([1, 2, 3], "m") != compute_content_hash(
+            [1, 2, 3], model_name="m"
+        )
+
+    def test_numpy_int_coercion_matches_plain_ints(self):
+        np = pytest.importorskip("numpy")
+        assert content_chunk_block_hash(
+            [np.int64(1), np.int64(2)], "m"
+        ) == content_chunk_block_hash([1, 2], "m")
+
 
 @pytest.mark.skipif(not _has_mlx(), reason="requires mlx")
 class TestExecuteChunkPrefillPlan:
@@ -773,6 +822,50 @@ class TestExecuteChunkPrefillPlan:
         # V is spliced through unchanged (no RoPE shift applies to V).
         assert mx.allclose(cache[0].values[:, :, 10:20, :], stored_values[:, :, 10:20, :])
 
+    def test_reuse_splice_folds_restored_prefix_into_rope_delta(self):
+        """A prefix-cache-restored cache starts at offset > 0; the spliced
+        K must be shifted by rope_delta + that base offset, not the plan-
+        relative rope_delta alone (which under-shifts by the prefix length).
+        """
+        import mlx.core as mx
+
+        n_heads, head_dim = 2, 8
+        base = 5
+        model = self._FakeModel(n_layers=1, n_heads=n_heads, head_dim=head_dim)
+        cache = [self._FakeKVCache(n_heads, head_dim)]
+        # Simulate a restored prefix: `base` tokens already in the cache.
+        cache[0].keys = mx.zeros((1, n_heads, base, head_dim))
+        cache[0].values = mx.zeros((1, n_heads, base, head_dim))
+        cache[0].offset = base
+
+        chunks = chunk_tokens(list(range(20)), min_chunk_tokens=20)
+        block_hash = b"\x33" * 32
+
+        class _Hit:
+            content_position = 100
+            block_hash = b"\x33" * 32
+
+        steps = plan_chunk_prefill([(chunks[0], _Hit())], recompute_pct=0.5)
+        reuse_step = steps[1]
+        assert reuse_step.kind == "reuse"
+
+        stored_keys = mx.random.normal((1, n_heads, 20, head_dim))
+        stored_values = mx.ones((1, n_heads, 20, head_dim))
+        ssd_manager = self._FakeSSDManager(
+            {block_hash: [(stored_keys, stored_values)]}
+        )
+
+        execute_chunk_prefill_plan(model, cache, steps, ssd_manager)
+
+        rope = model.layers[0].self_attn.rope
+        span = stored_keys[:, :, 10:20, :]
+        expected = shift_kv_rope(span, reuse_step.rope_delta + base, rope)
+        got = cache[0].keys[:, :, base + 10 : base + 20, :]
+        assert mx.allclose(got, expected, atol=1e-5)
+        # And explicitly NOT the un-based shift.
+        unbased = shift_kv_rope(span, reuse_step.rope_delta, rope)
+        assert not mx.allclose(got, unbased, atol=1e-3)
+
     def test_reuse_step_missing_block_raises(self):
         n_heads, head_dim = 2, 8
         model = self._FakeModel(n_layers=1, n_heads=n_heads, head_dim=head_dim)
@@ -790,6 +883,136 @@ class TestExecuteChunkPrefillPlan:
 
         with pytest.raises(RuntimeError):
             execute_chunk_prefill_plan(model, cache, steps, ssd_manager)
+
+
+@pytest.mark.skipif(not _has_mlx(), reason="requires mlx")
+class TestStoreMessageContentChunks:
+    """Message-aligned content-chunk store path + content-hash lookup at a
+    different position (the end-to-end pair that makes hits happen on real,
+    non-block-aligned prompts)."""
+
+    N_LAYERS = 2
+    N_HEADS = 2
+    HEAD_DIM = 8
+
+    def _make_prefix_cache(self, tmp_path):
+        from omlx.cache.paged_cache import PagedCacheManager
+        from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+        ssd = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            expected_model_name="test-model",
+            expected_num_layers=self.N_LAYERS,
+            expected_block_size=256,
+            expected_layer_cache_types=["KVCache"] * self.N_LAYERS,
+        )
+        paged = PagedCacheManager(
+            block_size=256,
+            max_blocks=16,
+            model_name="test-model",
+            initial_blocks=16,
+        )
+        pc = BlockAwarePrefixCache(
+            model=object(),
+            paged_cache_manager=paged,
+            paged_ssd_cache_manager=ssd,
+        )
+        return pc, ssd
+
+    def _make_cache_data(self, seq_len):
+        import mlx.core as mx
+
+        return [
+            {
+                "state": (
+                    mx.random.normal((1, self.N_HEADS, seq_len, self.HEAD_DIM)),
+                    mx.random.normal((1, self.N_HEADS, seq_len, self.HEAD_DIM)),
+                ),
+                "cache_type": "KVCache",
+            }
+            for _ in range(self.N_LAYERS)
+        ]
+
+    def test_store_then_hit_at_different_position(self, tmp_path):
+        pc, ssd = self._make_prefix_cache(tmp_path)
+        # Prompt: [system 0:10][doc-A 10:40][doc-B 40:70]
+        tokens = list(range(1000, 1070))
+        offsets = [10, 40]
+        saved = pc._store_message_content_chunks(
+            tokens,
+            self._make_cache_data(len(tokens)),
+            offsets,
+            ["KVCache"] * self.N_LAYERS,
+            min_tokens=8,
+        )
+        assert saved == 3
+
+        # New prompt with a different head and the docs swapped: doc-B now
+        # sits at [5:35) — a position (and block phase) never seen before.
+        new_tokens = list(range(5)) + tokens[40:70] + tokens[10:40]
+        pairs = chunks_with_manager_hits(
+            new_tokens, ssd, block_size=256, message_token_offsets=[5, 35]
+        )
+        assert [(c.start, c.end) for c, _ in pairs] == [(0, 5), (5, 35), (35, 65)]
+        head_hit, doc_b_hit, doc_a_hit = (h for _, h in pairs)
+        assert head_hit is None
+        assert doc_b_hit is not None and doc_b_hit.content_position == 40
+        assert doc_a_hit is not None and doc_a_hit.content_position == 10
+
+        # The stored KV is loadable and chunk-sized (what a reuse splice needs).
+        block_data = ssd.load_block(doc_b_hit.block_hash)
+        assert block_data is not None
+        assert len(block_data) == self.N_LAYERS
+        assert block_data[0][0].shape[2] == 30
+
+    def test_min_tokens_filter_skips_small_chunks(self, tmp_path):
+        pc, _ = self._make_prefix_cache(tmp_path)
+        tokens = list(range(100))
+        # Chunks: [0:10), [10:90), [90:100) — only the middle passes min 16.
+        saved = pc._store_message_content_chunks(
+            tokens,
+            self._make_cache_data(len(tokens)),
+            [10, 90],
+            ["KVCache"] * self.N_LAYERS,
+            min_tokens=16,
+        )
+        assert saved == 1
+
+    def test_non_kvcache_layers_refused(self, tmp_path):
+        pc, _ = self._make_prefix_cache(tmp_path)
+        tokens = list(range(64))
+        saved = pc._store_message_content_chunks(
+            tokens,
+            self._make_cache_data(len(tokens)),
+            [32],
+            ["KVCache", "RotatingKVCache"],
+            min_tokens=8,
+        )
+        assert saved == 0
+
+    def test_chunk_beyond_cache_seq_len_skipped(self, tmp_path):
+        pc, _ = self._make_prefix_cache(tmp_path)
+        tokens = list(range(64))
+        # KV only covers the first 40 tokens (e.g. trailing tokens were never
+        # part of the extracted cache) — the [32:64) chunk must be skipped.
+        saved = pc._store_message_content_chunks(
+            tokens,
+            self._make_cache_data(40),
+            [32],
+            ["KVCache"] * self.N_LAYERS,
+            min_tokens=8,
+        )
+        assert saved == 1
+
+    def test_duplicate_content_dedupes(self, tmp_path):
+        pc, ssd = self._make_prefix_cache(tmp_path)
+        tokens = list(range(64))
+        cache_data = self._make_cache_data(len(tokens))
+        args = (tokens, cache_data, [32], ["KVCache"] * self.N_LAYERS)
+        assert pc._store_message_content_chunks(*args, min_tokens=8) == 2
+        # Same content again: has_block short-circuits, nothing re-saved.
+        assert pc._store_message_content_chunks(*args, min_tokens=8) == 0
 
 
 class TestModelSettingsChunkKVReuse:

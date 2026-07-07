@@ -1635,6 +1635,18 @@ class PagedSSDCacheManager(CacheManager):
                 except (json.JSONDecodeError, TypeError):
                     pass
 
+            content_hash_hex = metadata.get("content_hash", "")
+            try:
+                content_hash = (
+                    bytes.fromhex(content_hash_hex) if content_hash_hex else None
+                )
+            except ValueError:
+                content_hash = None
+            try:
+                content_position = int(metadata.get("content_position", 0))
+            except (TypeError, ValueError):
+                content_position = 0
+
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),
                 file_path=file_path,
@@ -1648,6 +1660,8 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=metadata.get("cache_signature", ""),
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                content_hash=content_hash,
+                content_position=content_position if content_hash is not None else 0,
             )
         except Exception as e:
             logger.debug(f"Failed to read metadata from {file_path}: {e}")
@@ -2046,6 +2060,14 @@ class PagedSSDCacheManager(CacheManager):
                 "cache_signature": cache_signature,
                 "created_at": str(time.time()),
             }
+
+            # Persist the content-addressed identity (cacheblend chunk reuse)
+            # in the file metadata too: the RAM index is rebuilt from
+            # _read_file_metadata() on every startup/model reload, so fields
+            # missing here silently vanish from the index after a reload.
+            if content_hash is not None:
+                metadata["content_hash"] = content_hash.hex()
+                metadata["content_position"] = str(content_position)
 
             # Add cache type information if provided
             if layer_cache_types:

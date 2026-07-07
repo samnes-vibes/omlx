@@ -925,6 +925,8 @@ class TestSchedulerAddRequest:
             extra_key_token_start=None,
             extra_key_ranges=None,
             hot_cache_write_back=False,
+            message_token_offsets=None,
+            message_chunk_min_tokens=scheduler._chunk_kv_min_chunk_tokens,
         )
 
 
@@ -4517,6 +4519,43 @@ class TestChunkKVReusePrefillDispatch:
             request, tokens, existing_cache, vlm_embeds=None
         )
         assert result == (["sentinel-cache"], ["sentinel-token"])
+
+    def test_message_offsets_translated_to_remainder_coordinates(
+        self, mock_model, mock_tokenizer
+    ):
+        """request.message_token_offsets are absolute in the prompt; when a
+        prefix-cache hit trims the prompt, the lookup must probe chunks at
+        offsets shifted onto the remainder, dropping boundaries inside the
+        cached prefix (a raw offset would misalign every chunk hash)."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        manager = MagicMock()
+        manager.find_content_hash_hit.return_value = None
+        scheduler.paged_ssd_cache_manager = manager
+
+        request = self._request()
+        prompt = list(range(100, 130))  # 30 prompt tokens
+        request.prompt_token_ids = prompt
+        request.num_prompt_tokens = len(prompt)
+        # Boundaries at 5 (inside cached prefix -> dropped), 22 and 25.
+        request.message_token_offsets = [5, 22, 25]
+        tokens = prompt[20:]  # prefix cache restored the first 20
+
+        class KVCache:
+            pass
+
+        scheduler._do_prefill_with_chunk_reuse(request, tokens, [KVCache()], None)
+
+        # prefill_tokens = tokens[:-1] (9 tokens); relative starts 0, 2, 5.
+        probed = [
+            call.args[0] for call in manager.find_content_hash_hit.call_args_list
+        ]
+        prefill_tokens = tokens[:-1]
+        assert probed == [
+            prefill_tokens[0:2],
+            prefill_tokens[2:5],
+            prefill_tokens[5:9],
+        ]
 
     def test_execution_exception_falls_back_with_original_cache(
         self, mock_model, mock_tokenizer
