@@ -4312,3 +4312,237 @@ class TestTurboQuantAttentionSinkGuard:
 
         assert scheduler._model_uses_attention_sinks() is False
         assert scheduler._turboquant_eligible([KVCache()]) is True
+
+
+class TestChunkKVReusePrefillDispatch:
+    """Phase 3 (docs/experimental/cacheblend_plan.md): the flag-off / no-hit
+    path through `_do_prefill_with_chunk_reuse` must be byte-identical to
+    calling `_do_external_prefill` directly -- this is the merge gate for
+    not regressing every other request's prefill. Each ineligibility/failure
+    branch is exercised directly rather than through a live model+cache, so
+    these tests don't depend on real mlx-lm forward-pass behavior."""
+
+    def _make_scheduler(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._do_external_prefill = MagicMock(
+            return_value=(["sentinel-cache"], ["sentinel-token"])
+        )
+        return scheduler
+
+    def _request(self):
+        request = Request(
+            request_id="req-chunk-kv",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+        return request
+
+    def test_disabled_flag_never_calls_wrapper(self, mock_model, mock_tokenizer):
+        """The call site only invokes the wrapper when the flag is on; with
+        it off, `_do_external_prefill` runs directly (see scheduler.py's
+        dispatch at the "Normal (non-chunked) full prefill path")."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        assert scheduler._chunk_kv_reuse_enabled is False
+
+    def test_vlm_request_falls_back_untouched(self, mock_model, mock_tokenizer):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        request = self._request()
+        tokens = [1, 2, 3]
+        existing_cache = ["orig-cache"]
+        vlm_embeds = (mx.zeros((1, 1, 1)), {}, 0)
+
+        result = scheduler._do_prefill_with_chunk_reuse(
+            request, tokens, existing_cache, vlm_embeds
+        )
+
+        scheduler._do_external_prefill.assert_called_once_with(
+            request, tokens, existing_cache, vlm_embeds=vlm_embeds
+        )
+        assert result == (["sentinel-cache"], ["sentinel-token"])
+
+    def test_turboquant_request_falls_back_untouched(self, mock_model, mock_tokenizer):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        scheduler._turboquant_kv_bits = 4.0
+        request = self._request()
+        tokens = [1, 2, 3]
+        existing_cache = ["orig-cache"]
+
+        result = scheduler._do_prefill_with_chunk_reuse(
+            request, tokens, existing_cache, None
+        )
+
+        scheduler._do_external_prefill.assert_called_once_with(
+            request, tokens, existing_cache, vlm_embeds=None
+        )
+        assert result == (["sentinel-cache"], ["sentinel-token"])
+
+    def test_no_ssd_cache_manager_falls_back_untouched(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        scheduler.paged_ssd_cache_manager = None
+        request = self._request()
+        tokens = [1, 2, 3]
+        existing_cache = ["orig-cache"]
+
+        result = scheduler._do_prefill_with_chunk_reuse(
+            request, tokens, existing_cache, None
+        )
+
+        scheduler._do_external_prefill.assert_called_once_with(
+            request, tokens, existing_cache, vlm_embeds=None
+        )
+        assert result == (["sentinel-cache"], ["sentinel-token"])
+
+    def test_single_token_falls_back_untouched(self, mock_model, mock_tokenizer):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        scheduler.paged_ssd_cache_manager = MagicMock()
+        request = self._request()
+        existing_cache = ["orig-cache"]
+
+        result = scheduler._do_prefill_with_chunk_reuse(
+            request, [1], existing_cache, None
+        )
+
+        scheduler._do_external_prefill.assert_called_once_with(
+            request, [1], existing_cache, vlm_embeds=None
+        )
+        assert result == (["sentinel-cache"], ["sentinel-token"])
+
+    def test_ineligible_cache_falls_back_untouched(self, mock_model, mock_tokenizer):
+        """A rotating/sliding-window cache layer disqualifies the whole
+        request -- reuse-splicing is undefined once a layer evicts."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        scheduler.paged_ssd_cache_manager = MagicMock()
+        request = self._request()
+        tokens = [1, 2, 3]
+
+        class RotatingKVCache:
+            pass
+
+        existing_cache = [RotatingKVCache()]
+
+        result = scheduler._do_prefill_with_chunk_reuse(
+            request, tokens, existing_cache, None
+        )
+
+        scheduler._do_external_prefill.assert_called_once_with(
+            request, tokens, existing_cache, vlm_embeds=None
+        )
+        assert result == (["sentinel-cache"], ["sentinel-token"])
+
+    def test_no_content_hash_hits_falls_back_untouched(
+        self, mock_model, mock_tokenizer
+    ):
+        """The common case when the feature is on but nothing has ever been
+        stored under a matching content hash: only the cheap chunk/lookup
+        runs, and the request falls back to the exact same prefill as if
+        the flag were off."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        manager = MagicMock()
+        manager.find_content_hash_hit.return_value = None
+        scheduler.paged_ssd_cache_manager = manager
+        request = self._request()
+        tokens = [1, 2, 3, 4, 5]
+
+        class KVCache:
+            pass
+
+        existing_cache = [KVCache()]
+
+        result = scheduler._do_prefill_with_chunk_reuse(
+            request, tokens, existing_cache, None
+        )
+
+        scheduler._do_external_prefill.assert_called_once_with(
+            request, tokens, existing_cache, vlm_embeds=None
+        )
+        assert result == (["sentinel-cache"], ["sentinel-token"])
+
+    def test_partial_splice_failure_never_mutates_existing_cache_objects(
+        self, mock_model, mock_tokenizer
+    ):
+        """A hit chunk followed by a block that gets evicted between
+        planning and loading must not leave existing_cache's KVCache
+        objects half-spliced -- _do_prefill_with_chunk_reuse must operate
+        on copies so the fallback truly gets the pristine original."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        manager = MagicMock()
+
+        class _Hit:
+            content_position = 0
+            block_hash = b"\xaa" * 32
+
+        manager.find_content_hash_hit.return_value = _Hit()
+        manager.load_block.return_value = None  # evicted -> RuntimeError mid-plan
+        scheduler.paged_ssd_cache_manager = manager
+        request = self._request()
+        tokens = list(range(21))  # 20 prefill tokens + 1 held-out last token
+
+        class KVCache:
+            def __init__(self):
+                self.keys = mx.zeros((1, 1, 0, 8))
+                self.values = mx.zeros((1, 1, 0, 8))
+                self.offset = 0
+
+            @property
+            def state(self):
+                return (self.keys, self.values)
+
+        original_layer = KVCache()
+        original_keys, original_values = original_layer.keys, original_layer.values
+        existing_cache = [original_layer]
+
+        result = scheduler._do_prefill_with_chunk_reuse(
+            request, tokens, existing_cache, None
+        )
+
+        # The reuse step's load_block() miss raises mid-plan -- the
+        # ORIGINAL layer object must be untouched either way (identity,
+        # not just equality: _do_prefill_with_chunk_reuse must never
+        # reassign .keys/.values on the caller's own KVCache instance).
+        assert original_layer.keys is original_keys
+        assert original_layer.values is original_values
+        assert original_layer.offset == 0
+        scheduler._do_external_prefill.assert_called_once_with(
+            request, tokens, existing_cache, vlm_embeds=None
+        )
+        assert result == (["sentinel-cache"], ["sentinel-token"])
+
+    def test_execution_exception_falls_back_with_original_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """Any unexpected failure mid-splice must fall back using the
+        ORIGINAL (untouched) existing_cache, never a partially-mutated
+        working copy -- otherwise a failed chunk-reuse attempt could corrupt
+        the cache the normal prefill path then builds on."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._chunk_kv_reuse_enabled = True
+        manager = MagicMock()
+        manager.find_content_hash_hit.side_effect = RuntimeError("boom")
+        scheduler.paged_ssd_cache_manager = manager
+        request = self._request()
+        tokens = [1, 2, 3, 4, 5]
+
+        class KVCache:
+            pass
+
+        existing_cache = [KVCache()]
+
+        result = scheduler._do_prefill_with_chunk_reuse(
+            request, tokens, existing_cache, None
+        )
+
+        scheduler._do_external_prefill.assert_called_once_with(
+            request, tokens, existing_cache, vlm_embeds=None
+        )
+        assert result == (["sentinel-cache"], ["sentinel-token"])

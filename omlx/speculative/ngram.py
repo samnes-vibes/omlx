@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 # Defaults chosen per docs/experimental/ngram_speculation_plan.md; tuned on
-# the reference workloads in scripts/spec_bench.py.
+# the reference workloads in scripts/perf_bench.py.
 DEFAULT_MIN_N = 2
 DEFAULT_MAX_N = 4
 DEFAULT_MAX_DRAFT = 8

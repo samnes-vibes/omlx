@@ -3,7 +3,7 @@
 Date: 2026-07-05 (results appended same day — see "Measured results" at the end)
 Branch: `feat/ngram-spec-decoding`
 Status: **implemented** (`omlx/speculative/ngram.py`, `omlx/patches/ngram_spec.py`,
-`scripts/spec_bench.py`; enabled per-model via `ngram_spec_enabled`)
+`scripts/perf_bench.py`; enabled per-model via `ngram_spec_enabled`)
 Companion to: [5x_speedup_research.md](5x_speedup_research.md) (item A2.1, ranked #1 in recommended order),
 [low_ram_perf_optimization_map.md](low_ram_perf_optimization_map.md) (items 0, 2a, 2d)
 

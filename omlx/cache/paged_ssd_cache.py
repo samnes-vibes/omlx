@@ -37,6 +37,7 @@ import numpy as np
 from omlx.utils.formatting import format_bytes
 
 from .interface import CacheManager
+from .kv_reuse import compute_content_hash
 from .stats import PagedSSDCacheStats
 
 logger = logging.getLogger(__name__)
@@ -497,6 +498,16 @@ class PagedSSDBlockMetadata:
         cache_signature: Compatibility signature for the saved cache layout
         layer_cache_types: Per-layer cache type names (e.g., ["KVCache", "ArraysCache"])
         layer_meta_states: Per-layer meta_state tuples for reconstruction
+        content_hash: Position-independent hash of this block's token ids
+            (+ model-compat signature), used for CacheBlend-style chunk reuse
+            regardless of where the chunk lands in a future prompt. None for
+            blocks written before this field existed, or where the store
+            path opted out. Distinct from block_hash, which chains through
+            parent blocks and is therefore position-dependent.
+        content_position: Token offset this block was originally stored at.
+            The chunk-reuse load path needs this to compute the RoPE shift
+            delta (actual_position - content_position) when splicing the
+            block's KV in at a different offset.
     """
 
     block_hash: bytes
@@ -511,6 +522,8 @@ class PagedSSDBlockMetadata:
     cache_signature: str = ""
     layer_cache_types: list[str] | None = None
     layer_meta_states: list[tuple] | None = None
+    content_hash: bytes | None = None
+    content_position: int = 0
 
     def touch(self) -> None:
         """Update last access time."""
@@ -535,6 +548,9 @@ class PagedSSDBlockMetadata:
         if self.layer_meta_states:
             # Convert tuples to lists for JSON serialization
             result["layer_meta_states"] = [list(m) for m in self.layer_meta_states]
+        if self.content_hash is not None:
+            result["content_hash"] = self.content_hash.hex()
+            result["content_position"] = self.content_position
         return result
 
     @classmethod
@@ -544,6 +560,8 @@ class PagedSSDBlockMetadata:
         layer_meta_states = None
         if "layer_meta_states" in data and data["layer_meta_states"]:
             layer_meta_states = [tuple(m) for m in data["layer_meta_states"]]
+
+        content_hash = data.get("content_hash")
 
         return cls(
             block_hash=bytes.fromhex(data["block_hash"]),
@@ -558,6 +576,8 @@ class PagedSSDBlockMetadata:
             cache_signature=data.get("cache_signature", ""),
             layer_cache_types=data.get("layer_cache_types"),
             layer_meta_states=layer_meta_states,
+            content_hash=bytes.fromhex(content_hash) if content_hash else None,
+            content_position=data.get("content_position", 0),
         )
 
 
@@ -581,6 +601,12 @@ class PagedSSDCacheIndex:
         self._total_size: int = 0
         self._max_size: int = max_size_bytes
         self._lock = threading.RLock()
+        # Secondary index: content_hash -> block_hashes sharing that content.
+        # Position-independent, so the same content_hash can map to several
+        # block_hashes (the prefix-chain hash differs per position/lineage).
+        # Kept in sync with self._index by add()/remove(); never touched by
+        # LRU/eviction directly (that stays keyed on block_hash).
+        self._content_index: dict[bytes, set[bytes]] = {}
 
     def add(self, metadata: PagedSSDBlockMetadata) -> None:
         """
@@ -595,10 +621,51 @@ class PagedSSDCacheIndex:
                 old_meta = self._index[metadata.block_hash]
                 self._total_size -= old_meta.file_size
                 del self._lru[metadata.block_hash]
+                self._unlink_content_hash(old_meta)
 
             self._index[metadata.block_hash] = metadata
             self._lru[metadata.block_hash] = metadata.last_access
             self._total_size += metadata.file_size
+            if metadata.content_hash is not None:
+                self._content_index.setdefault(metadata.content_hash, set()).add(
+                    metadata.block_hash
+                )
+
+    def _unlink_content_hash(self, metadata: PagedSSDBlockMetadata) -> None:
+        """Remove metadata's block_hash from the content-hash secondary index."""
+        if metadata.content_hash is None:
+            return
+        block_hashes = self._content_index.get(metadata.content_hash)
+        if block_hashes is None:
+            return
+        block_hashes.discard(metadata.block_hash)
+        if not block_hashes:
+            del self._content_index[metadata.content_hash]
+
+    def get_by_content_hash(self, content_hash: bytes) -> list[PagedSSDBlockMetadata]:
+        """
+        Get all blocks sharing a position-independent content hash.
+
+        Args:
+            content_hash: Content hash of the chunk (token ids + compat
+                signature), independent of where it was originally stored.
+
+        Returns:
+            Metadata for every currently-indexed block with this content
+            hash (usually 0 or 1 entries; more than one means the same
+            chunk content was stored from more than one prefix lineage),
+            most recently accessed first — so callers taking the first
+            entry get a deterministic, recency-preferring pick.
+        """
+        with self._lock:
+            block_hashes = self._content_index.get(content_hash)
+            if not block_hashes:
+                return []
+            return sorted(
+                (self._index[bh] for bh in block_hashes if bh in self._index),
+                key=lambda m: m.last_access,
+                reverse=True,
+            )
 
     def sort_lru_by_last_access(self) -> None:
         """Restore LRU ordering from each entry's last access timestamp."""
@@ -644,6 +711,7 @@ class PagedSSDCacheIndex:
             metadata = self._index.pop(block_hash)
             del self._lru[block_hash]
             self._total_size -= metadata.file_size
+            self._unlink_content_hash(metadata)
             return metadata
 
     def touch(self, block_hash: bytes) -> None:
@@ -1711,6 +1779,8 @@ class PagedSSDCacheManager(CacheManager):
         layer_cache_types: list[str] | None = None,
         layer_meta_states: list[tuple] | None = None,
         hot_cache_write_back: bool = True,
+        content_token_ids: list[int] | None = None,
+        content_position: int = 0,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -1732,6 +1802,16 @@ class PagedSSDCacheManager(CacheManager):
                 for reconstruction (e.g., [(offset,), (keep, max_size, offset, _idx)]).
             hot_cache_write_back: When False in SSD-backed hot-cache mode, enqueue
                 through the SSD writer path instead of retaining a hot-cache copy.
+            content_token_ids: Optional raw token ids for this block. When
+                given, a position-independent content hash (see
+                `omlx.cache.kv_reuse.compute_content_hash`) is derived from
+                them and the block's own `cache_signature`, and recorded on
+                the metadata for CacheBlend-style chunk reuse. None leaves
+                the block findable only by its (position-dependent)
+                `block_hash`.
+            content_position: Token offset this block was saved at; recorded
+                alongside the derived content hash so a future load path can
+                compute the RoPE shift delta for reuse at a different offset.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -1945,6 +2025,15 @@ class PagedSSDCacheManager(CacheManager):
                 block_size=block_size,
                 layer_cache_types=layer_cache_types,
             )
+            content_hash = (
+                compute_content_hash(
+                    content_token_ids,
+                    model_name=model_name,
+                    cache_signature=cache_signature,
+                )
+                if content_token_ids is not None
+                else None
+            )
 
             # Prepare metadata
             metadata = {
@@ -2015,6 +2104,8 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=cache_signature,
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                content_hash=content_hash,
+                content_position=content_position if content_hash is not None else 0,
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
@@ -2739,6 +2830,71 @@ class PagedSSDCacheManager(CacheManager):
             if block_hash in self._pending_write_buffers:
                 return True
         return False
+
+    def would_hit_content(self, token_ids: list[int]) -> bool:
+        """
+        Whether these exact tokens are already stored under a
+        position-independent content hash, regardless of where they'd land
+        in the current request.
+
+        Phase 1 (see docs/experimental/cacheblend_plan.md) telemetry only:
+        this reports a would-hit signal for the go/no-go hit-rate gate. It
+        does not load or reuse anything yet — that's a later phase.
+
+        Args:
+            token_ids: Candidate chunk's raw token ids.
+
+        Returns:
+            True if a block with this content hash is currently indexed.
+        """
+        if not token_ids:
+            return False
+        # Mirror save_block's block_size fallback (self._expected_block_size
+        # is 0 until a save adopts it) so the signature computed here always
+        # matches the one blocks were actually saved under.
+        block_size = self._expected_block_size or len(token_ids)
+        cache_signature = _cache_compat_signature(
+            model_name=self._expected_model_name,
+            num_layers=self._expected_num_layers,
+            block_size=block_size,
+            layer_cache_types=self._expected_layer_cache_types,
+        )
+        content_hash = compute_content_hash(
+            token_ids,
+            model_name=self._expected_model_name,
+            cache_signature=cache_signature,
+        )
+        return bool(self._index.get_by_content_hash(content_hash))
+
+    def find_content_hash_hit(self, token_ids: list[int]) -> "PagedSSDBlockMetadata | None":
+        """
+        Like `would_hit_content`, but returns the actual metadata (incl.
+        `block_hash` for `load_block()` and `content_position` for the RoPE
+        shift) instead of a bare bool -- Phase 3 execution needs both.
+
+        Args:
+            token_ids: Candidate chunk's raw token ids.
+
+        Returns:
+            The most-recently-accessed metadata entry sharing this content
+            hash (see `PagedSSDCacheIndex.get_by_content_hash`), or None.
+        """
+        if not token_ids:
+            return None
+        block_size = self._expected_block_size or len(token_ids)
+        cache_signature = _cache_compat_signature(
+            model_name=self._expected_model_name,
+            num_layers=self._expected_num_layers,
+            block_size=block_size,
+            layer_cache_types=self._expected_layer_cache_types,
+        )
+        content_hash = compute_content_hash(
+            token_ids,
+            model_name=self._expected_model_name,
+            cache_signature=cache_signature,
+        )
+        hits = self._index.get_by_content_hash(content_hash)
+        return hits[0] if hits else None
 
     def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:
         """

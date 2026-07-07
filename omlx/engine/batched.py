@@ -371,6 +371,18 @@ class BatchedEngine(BaseEngine):
                 scheduler._set_model_info_for_monitor()
         scheduler.refresh_ssd_layer_signature()
 
+        # CacheBlend-style chunk-KV reuse: propagate to scheduler (Phase 3,
+        # see docs/experimental/cacheblend_plan.md). Prefill-side only --
+        # nothing to activate on the model itself, unlike the decode-time
+        # patches above.
+        if self._model_settings is not None:
+            scheduler._chunk_kv_reuse_enabled = bool(
+                getattr(self._model_settings, "chunk_kv_reuse_enabled", False)
+            )
+            scheduler._chunk_kv_recompute_pct = float(
+                getattr(self._model_settings, "chunk_kv_recompute_pct", None) or 0.15
+            )
+
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
             specprefill_draft = getattr(

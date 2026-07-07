@@ -151,6 +151,10 @@ class ModelSettingsRequest(BaseModel):
     ngram_spec_min_n: int | None = None
     ngram_spec_max_n: int | None = None
     ngram_spec_max_draft: int | None = None
+    # CacheBlend-style non-prefix KV reuse (prefill-side, experimental)
+    chunk_kv_reuse_enabled: bool | None = None
+    chunk_kv_recompute_pct: float | None = None
+    chunk_kv_min_chunk_tokens: int | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -517,6 +521,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["mtp_enabled"] = False
     settings["vlm_mtp_enabled"] = False
     settings["ngram_spec_enabled"] = False
+    settings["chunk_kv_reuse_enabled"] = False
 
     unsupported_ct_kwargs = {
         "enable_thinking",
@@ -607,6 +612,9 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.ngram_spec_min_n = None
     settings.ngram_spec_max_n = None
     settings.ngram_spec_max_draft = None
+    settings.chunk_kv_reuse_enabled = False
+    settings.chunk_kv_recompute_pct = None
+    settings.chunk_kv_min_chunk_tokens = None
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
     settings.vlm_mtp_draft_block_size = None
@@ -1747,11 +1755,27 @@ async def get_ngram_spec_stats(
     ``requests / cycles / plain_steps / proposed_tokens / accepted_tokens``
     plus emit and timing breakdowns, summed over finished requests since
     server start (or the last ``?reset=true`` call — used by
-    ``scripts/spec_bench.py`` to isolate per-scenario acceptance rates).
+    ``scripts/perf_bench.py`` to isolate per-scenario acceptance rates).
     """
     from ..patches.ngram_spec import get_ngram_spec_totals
 
     return {"totals": get_ngram_spec_totals(reset=reset)}
+
+
+@router.get("/api/kv-reuse/stats")
+async def get_kv_reuse_stats(
+    reset: bool = False, is_admin: bool = Depends(require_admin)
+):
+    """Cumulative CacheBlend-style chunk-KV-reuse counters.
+
+    ``requests / chunks_total / chunks_hit / tokens_reused /
+    tokens_forwarded``, summed over prefills that attempted chunk reuse
+    since server start (or the last ``?reset=true`` call — used by
+    ``scripts/perf_bench.py``'s ``--stats-path`` A/B harness).
+    """
+    from ..cache.kv_reuse import get_kv_reuse_totals
+
+    return {"totals": get_kv_reuse_totals(reset=reset)}
 
 
 @router.get("/api/grammar/parsers")
@@ -2495,6 +2519,48 @@ async def update_model_settings(
             detail="ngram_spec_max_n must be >= ngram_spec_min_n.",
         )
 
+    # CacheBlend-style non-prefix KV reuse (prefill-side, experimental; see
+    # docs/experimental/cacheblend_plan.md)
+    if "chunk_kv_reuse_enabled" in sent:
+        new_chunk_kv_reuse = False if is_diffusion_model else bool(
+            request.chunk_kv_reuse_enabled
+        )
+        if new_chunk_kv_reuse:
+            for other_field, other_label in (
+                ("dflash_enabled", "DFlash"),
+                ("turboquant_kv_enabled", "TurboQuant KV"),
+            ):
+                other_after = (
+                    bool(getattr(request, other_field))
+                    if other_field in sent
+                    else getattr(current_settings, other_field)
+                )
+                if other_after:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"chunk_kv_reuse_enabled and {other_label} cannot "
+                            "both be enabled."
+                        ),
+                    )
+        current_settings.chunk_kv_reuse_enabled = new_chunk_kv_reuse
+    if "chunk_kv_recompute_pct" in sent:
+        value = request.chunk_kv_recompute_pct
+        if value is not None and not (0.0 < value <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="chunk_kv_recompute_pct must be in (0, 1].",
+            )
+        current_settings.chunk_kv_recompute_pct = value
+    if "chunk_kv_min_chunk_tokens" in sent:
+        value = request.chunk_kv_min_chunk_tokens
+        if value is not None and value <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="chunk_kv_min_chunk_tokens must be positive.",
+            )
+        current_settings.chunk_kv_min_chunk_tokens = value
+
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
         new_vlm_mtp = False if is_diffusion_model else bool(request.vlm_mtp_enabled)
@@ -2633,6 +2699,10 @@ async def update_model_settings(
         or "ngram_spec_min_n" in sent
         or "ngram_spec_max_n" in sent
         or "ngram_spec_max_draft" in sent
+        # chunk-KV reuse is propagated to the scheduler at engine start
+        or "chunk_kv_reuse_enabled" in sent
+        or "chunk_kv_recompute_pct" in sent
+        or "chunk_kv_min_chunk_tokens" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent

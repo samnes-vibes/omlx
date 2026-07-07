@@ -51,6 +51,9 @@
         'ngram_spec_min_n',
         'ngram_spec_max_n',
         'ngram_spec_max_draft',
+        'chunk_kv_reuse_enabled',
+        'chunk_kv_recompute_pct',
+        'chunk_kv_min_chunk_tokens',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
@@ -1481,6 +1484,9 @@
                     ngram_spec_min_n: s.ngram_spec_min_n ?? null,
                     ngram_spec_max_n: s.ngram_spec_max_n ?? null,
                     ngram_spec_max_draft: s.ngram_spec_max_draft ?? null,
+                    chunk_kv_reuse_enabled: s.chunk_kv_reuse_enabled || false,
+                    chunk_kv_recompute_pct: s.chunk_kv_recompute_pct ?? null,
+                    chunk_kv_min_chunk_tokens: s.chunk_kv_min_chunk_tokens ?? null,
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
@@ -2036,6 +2042,15 @@
                                     && this.modelSettings.ngram_spec_max_draft
                                     ? parseInt(this.modelSettings.ngram_spec_max_draft)
                                     : null,
+                                chunk_kv_reuse_enabled: !!this.modelSettings.chunk_kv_reuse_enabled,
+                                chunk_kv_recompute_pct: this.modelSettings.chunk_kv_reuse_enabled
+                                    && this.modelSettings.chunk_kv_recompute_pct
+                                    ? parseFloat(this.modelSettings.chunk_kv_recompute_pct)
+                                    : null,
+                                chunk_kv_min_chunk_tokens: this.modelSettings.chunk_kv_reuse_enabled
+                                    && this.modelSettings.chunk_kv_min_chunk_tokens
+                                    ? parseInt(this.modelSettings.chunk_kv_min_chunk_tokens)
+                                    : null,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -2085,6 +2100,9 @@
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
                                     ngram_spec_enabled: false,
+                                    chunk_kv_reuse_enabled: false,
+                                    chunk_kv_recompute_pct: null,
+                                    chunk_kv_min_chunk_tokens: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
@@ -2177,6 +2195,9 @@
                         this.modelSettings.ngram_spec_min_n = null;
                         this.modelSettings.ngram_spec_max_n = null;
                         this.modelSettings.ngram_spec_max_draft = null;
+                        this.modelSettings.chunk_kv_reuse_enabled = false;
+                        this.modelSettings.chunk_kv_recompute_pct = null;
+                        this.modelSettings.chunk_kv_min_chunk_tokens = null;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));

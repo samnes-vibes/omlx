@@ -783,5 +783,10 @@
   "modal.model_settings.ngram_spec_conflict": "Disable other speculative decoding paths (MTP / DFlash / VLM MTP) first.",
   "modal.model_settings.ngram_spec_min_n": "Min n-gram",
   "modal.model_settings.ngram_spec_max_n": "Max n-gram",
-  "modal.model_settings.ngram_spec_max_draft": "Max draft tokens"
+  "modal.model_settings.ngram_spec_max_draft": "Max draft tokens",
+  "modal.model_settings.chunk_kv_reuse": "Chunk KV Reuse (CacheBlend)",
+  "modal.model_settings.chunk_kv_reuse_hint": "Experimental, prefill-side: reuses precomputed KV for repeated prompt chunks regardless of position (RAG, reordered context, agent loops), recomputing only a small leading fraction of each reused chunk to repair cross-chunk attention. Approximate, not lossless -- see the recompute % knob.",
+  "modal.model_settings.chunk_kv_reuse_conflict": "Disable DFlash / TurboQuant KV first.",
+  "modal.model_settings.chunk_kv_recompute_pct": "Recompute %",
+  "modal.model_settings.chunk_kv_min_chunk_tokens": "Min chunk tokens"
 }

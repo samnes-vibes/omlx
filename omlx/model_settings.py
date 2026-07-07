@@ -96,6 +96,13 @@ class ModelSettings:
         ngram_spec_min_n: Shortest n-gram to match (None = default 2).
         ngram_spec_max_n: Longest n-gram to match (None = default 4).
         ngram_spec_max_draft: Max draft tokens proposed per cycle (None = default 8).
+        chunk_kv_reuse_enabled: Enable CacheBlend-style non-prefix KV reuse
+            (experimental, prefill-side). Mutually exclusive with
+            dflash_enabled and turboquant_kv_enabled.
+        chunk_kv_recompute_pct: Fraction of each reused chunk's tokens to
+            recompute to repair cross-chunk attention (None = default 0.15).
+        chunk_kv_min_chunk_tokens: Fixed chunk size for the fallback
+            (non-message-boundary) chunker (None = default 256).
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model.
@@ -210,6 +217,21 @@ class ModelSettings:
     ngram_spec_max_n: Optional[int] = None  # None = default 4
     ngram_spec_max_draft: Optional[int] = None  # None = default 8
 
+    # CacheBlend-style non-prefix KV reuse (experimental, prefill-side; see
+    # docs/experimental/cacheblend_plan.md). Reuses precomputed per-chunk KV
+    # regardless of its position in the prompt, RoPE-shifting stored K to the
+    # new position and recomputing only a small leading fraction of each
+    # reused chunk to repair cross-chunk attention. Orthogonal to the
+    # decode-side speculative paths (ngram_spec, mtp, dflash) — this only
+    # touches prefill — but incompatible with dflash (owns its own
+    # engine/cache) and TurboQuant KV (v1 cannot RoPE-shift quantized KV
+    # without a dequant round-trip; see the plan's "Later" section).
+    # NOTE: as of Phase 2, this flag only gates settings validation — the
+    # prefill-path arbitration that would make it do anything is Phase 3.
+    chunk_kv_reuse_enabled: bool = False
+    chunk_kv_recompute_pct: Optional[float] = None  # None = default 0.15
+    chunk_kv_min_chunk_tokens: Optional[int] = None  # None = default 256
+
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
@@ -281,6 +303,29 @@ class ModelSettings:
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
                     )
+        # Chunk KV reuse is prefill-side (orthogonal to the decode-side
+        # speculative paths above) but shares no code with dflash's own
+        # engine/cache, and v1 cannot RoPE-shift TurboQuant's quantized KV
+        # without a dequant round-trip (see cacheblend_plan.md "Later").
+        if self.chunk_kv_reuse_enabled:
+            for name, value in (
+                ("dflash_enabled", self.dflash_enabled),
+                ("turboquant_kv_enabled", self.turboquant_kv_enabled),
+            ):
+                if value:
+                    raise ValueError(
+                        f"chunk_kv_reuse_enabled and {name} cannot both be True"
+                    )
+            if (
+                self.chunk_kv_recompute_pct is not None
+                and not (0.0 < self.chunk_kv_recompute_pct <= 1.0)
+            ):
+                raise ValueError("chunk_kv_recompute_pct must be in (0, 1]")
+            if (
+                self.chunk_kv_min_chunk_tokens is not None
+                and self.chunk_kv_min_chunk_tokens <= 0
+            ):
+                raise ValueError("chunk_kv_min_chunk_tokens must be positive")
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

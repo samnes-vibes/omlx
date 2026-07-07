@@ -23,6 +23,7 @@ except ImportError:
 from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
+from .kv_reuse import compute_content_hash
 from .paged_cache import (
     BlockTable,
     PagedCacheManager,
@@ -133,6 +134,13 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+
+        # Phase 1 CacheBlend telemetry (see docs/experimental/cacheblend_plan.md):
+        # counts blocks whose content hash was already indexed elsewhere at
+        # store time, i.e. would have been a non-prefix reuse hit had that
+        # path existed. Logging only — does not change what gets stored.
+        self._content_hash_would_hit = 0
+        self._content_hash_candidates = 0
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -593,6 +601,13 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Extract tensor slice and save to paged SSD
             if is_tensor_data and HAS_MLX and self.paged_ssd_cache is not None:
+                # Phase 1 CacheBlend telemetry: would this block's content
+                # already be findable under a position-independent content
+                # hash? Logged only, no behavior change (see cacheblend_plan.md).
+                self._content_hash_candidates += 1
+                if self.paged_ssd_cache.would_hit_content(block_tokens):
+                    self._content_hash_would_hit += 1
+
                 cache_seq_len = self._get_cache_seq_len(cache_data)
 
                 # Determine whether extracted cache_data uses:
@@ -699,6 +714,8 @@ class BlockAwarePrefixCache(CacheManager):
                             model_name=self.paged_cache.model_name,
                             layer_cache_types=layer_cache_types,
                             layer_meta_states=block_meta,
+                            content_token_ids=block_tokens,
+                            content_position=global_start,
                         )
                     else:
                         saved = self.paged_ssd_cache.save_block(
@@ -707,6 +724,8 @@ class BlockAwarePrefixCache(CacheManager):
                             token_count=block.token_count,
                             model_name=self.paged_cache.model_name,
                             layer_cache_types=layer_cache_types,
+                            content_token_ids=block_tokens,
+                            content_position=global_start,
                             layer_meta_states=block_meta,
                             hot_cache_write_back=False,
                         )
@@ -2857,6 +2876,8 @@ class BlockAwarePrefixCache(CacheManager):
             "tokens_matched_total": self._tokens_matched_total,
             "tokens_requested_total": self._tokens_requested_total,
             "active_requests": len(self._request_tables),
+            "content_hash_would_hit": self._content_hash_would_hit,
+            "content_hash_candidates": self._content_hash_candidates,
             **paged_stats,
         }
 
@@ -2871,6 +2892,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._content_hash_would_hit = 0
+        self._content_hash_candidates = 0
         self.paged_cache.reset_stats()
 
     def clear(self) -> int:

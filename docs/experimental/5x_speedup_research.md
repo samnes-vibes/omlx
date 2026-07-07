@@ -2,6 +2,7 @@
 
 Date: 2026-07-05
 Companion to: [dflash_mlx_integration.md](dflash_mlx_integration.md), [low_ram_perf_optimization_map.md](low_ram_perf_optimization_map.md)
+Measured outcomes ledger: [speedup_results_tracker.md](speedup_results_tracker.md)
 
 ## Framing
 
@@ -115,12 +116,12 @@ Multipliers are rough geometric estimates on plausible workloads; they multiply 
 
 ## Recommended order
 
-1. **A2.1 n-gram/prompt-lookup speculation** — days of work, zero memory, 2–3x on the workloads local users actually run. Do this first.
-2. **B2 CacheBlend on the SSD cache** — the storage and RoPE-shift primitives already exist in-repo; highest TTFT leverage per engineering hour.
-3. **A1.1 + A1.2 DFlash context ceiling + prefix cache** — turns the existing 3–4x into an always-on 5x+.
-4. **B1 draft-free sparse prefill** — replace SpecPrefill's scoring stage with calibrated static patterns; keep its selection/RoPE code.
-5. **A3 fused int4 attention kernel** in `custom_kernels/` — multiplies with everything; reference implementation exists (Open-TQ-Metal).
-6. **A4 / A5 / B3** — research spikes (ANE pipeline, dLLM engine, ANE prefill): high ceiling, high cost; prototype behind experimental flags like DFlash was.
+1. **A2.1 n-gram/prompt-lookup speculation** — days of work, zero memory, 2–3x on the workloads local users actually run. Do this first. → [ngram_speculation_plan.md](ngram_speculation_plan.md) (**implemented**)
+2. **B2 CacheBlend on the SSD cache** — the storage and RoPE-shift primitives already exist in-repo; highest TTFT leverage per engineering hour. → [cacheblend_plan.md](cacheblend_plan.md)
+3. **A1.1 + A1.2 DFlash context ceiling + prefix cache** — turns the existing 3–4x into an always-on 5x+. → [dflash2_long_context_plan.md](dflash2_long_context_plan.md) (note: prefix cache + adaptive/ddtree verify already shipped since this doc was written)
+4. **B1 draft-free sparse prefill** — replace SpecPrefill's scoring stage with calibrated static patterns; keep its selection/RoPE code. → [sparse_prefill_plan.md](sparse_prefill_plan.md)
+5. **A3 fused int4 attention kernel** in `custom_kernels/` — multiplies with everything; reference implementation exists (Open-TQ-Metal). → [fused_int4_attention_plan.md](fused_int4_attention_plan.md)
+6. **A4 / A5 / B3** — research spikes (ANE pipeline, dLLM engine, ANE prefill): high ceiling, high cost; prototype behind experimental flags like DFlash was. → [research_spikes_plan.md](research_spikes_plan.md)
 
 ## Sources
 

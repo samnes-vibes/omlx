@@ -73,6 +73,9 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_keep_pct",
     "specprefill_threshold",
     "index_cache_freq",
+    "chunk_kv_reuse_enabled",
+    "chunk_kv_recompute_pct",
+    "chunk_kv_min_chunk_tokens",
 )
 
 # Excluded — never stored in a profile or template.
