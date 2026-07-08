@@ -34,6 +34,16 @@ def _dense_causal(q, k, v, scale):
     )
 
 
+@pytest.fixture
+def stage1_only(monkeypatch):
+    """Force the Stage-1 masked path (exact per-head pattern semantics)."""
+    import omlx.patches.sparse_prefill as sp
+
+    monkeypatch.setattr(sp, "_USE_MASKLESS", False)
+    monkeypatch.setattr(sp, "_USE_KERNEL", False)
+
+
+@pytest.mark.usefixtures("stage1_only")
 class TestSparseAttention:
     def test_full_coverage_matches_dense(self):
         """sink+window covering everything must reproduce dense attention."""
@@ -106,6 +116,127 @@ class TestSparseAttention:
         out = sparse_prefill_attention(q, k, v, scale, heads, budget=1.5)
         ref = _dense_causal(q, k, v, scale)
         assert mx.abs(out - ref).max().item() < 1e-2
+
+
+class TestFusedKernel:
+    """Stage-2 Metal kernel vs the Stage-1 block/mask reference path."""
+
+    def _both_paths(self, monkeypatch, q, k, v, scale, heads, budget):
+        import omlx.patches.sparse_prefill as sp
+        from omlx.custom_kernels import sparse_prefill as kernels
+
+        if not kernels.is_available():
+            pytest.skip("Metal kernel unavailable on this device")
+        monkeypatch.setattr(sp, "_USE_MASKLESS", False)
+        monkeypatch.setattr(sp, "_USE_KERNEL", True)
+        fused = sparse_prefill_attention(q, k, v, scale, heads, budget=budget)
+        monkeypatch.setattr(sp, "_USE_KERNEL", False)
+        ref = sparse_prefill_attention(q, k, v, scale, heads, budget=budget)
+        return fused, ref
+
+    def test_matches_stage1_vertical_slash(self, monkeypatch):
+        q, k, v, scale = _rand_qkv(K=2048, L=512)
+        heads = [HeadPattern("vertical_slash", sink=64, window=128)] * 8
+        fused, ref = self._both_paths(monkeypatch, q, k, v, scale, heads, 0.2)
+        assert bool(mx.isfinite(fused).all().item())
+        assert mx.abs(fused - ref).max().item() < 5e-3
+
+    def test_matches_stage1_a_shape(self, monkeypatch):
+        q, k, v, scale = _rand_qkv(K=1536, L=1536, Hq=4, Hkv=4)
+        heads = [HeadPattern("a_shape", sink=32, window=200)] * 4
+        fused, ref = self._both_paths(monkeypatch, q, k, v, scale, heads, 0.2)
+        assert mx.abs(fused - ref).max().item() < 5e-3
+
+    def test_matches_stage1_mixed_heads_chunk_offset(self, monkeypatch):
+        q, k, v, scale = _rand_qkv(K=3072, L=640)
+        heads = [
+            HeadPattern("vertical_slash", sink=64, window=256),
+            HeadPattern("a_shape", sink=256, window=512),
+        ] * 4
+        fused, ref = self._both_paths(monkeypatch, q, k, v, scale, heads, 0.3)
+        assert mx.abs(fused - ref).max().item() < 5e-3
+
+    def test_matches_dense_when_fully_covered(self, monkeypatch):
+        import omlx.patches.sparse_prefill as sp
+        from omlx.custom_kernels import sparse_prefill as kernels
+
+        if not kernels.is_available():
+            pytest.skip("Metal kernel unavailable on this device")
+        q, k, v, scale = _rand_qkv(K=768, L=768)
+        heads = [HeadPattern("vertical_slash", sink=256, window=512)] * 8
+        monkeypatch.setattr(sp, "_USE_MASKLESS", False)
+        monkeypatch.setattr(sp, "_USE_KERNEL", True)
+        out = sparse_prefill_attention(q, k, v, scale, heads, budget=1.5)
+        ref = _dense_causal(q, k, v, scale)
+        assert mx.abs(out - ref).max().item() < 1e-2
+
+
+class TestMasklessPath:
+    """Maskless block-SDPA fast path (_maskless_attention)."""
+
+    def test_saturating_budget_matches_dense(self):
+        """Budget large enough that sink + col zone + window cover every
+        causal key: maskless output must equal dense attention. Single
+        query block, since the col zone ends at the first block's window
+        start (later blocks' windows open a gap by design)."""
+        import omlx.patches.sparse_prefill as sp
+
+        q, k, v, scale = _rand_qkv(K=4096, L=512)
+        heads = [HeadPattern("vertical_slash", sink=256, window=512)] * 8
+        out = sp._maskless_attention(q, k, v, scale, heads, budget=1.5,
+                                     query_block=512)
+        assert out is not None
+        ref = _dense_causal(q, k, v, scale)
+        assert mx.abs(out - ref).max().item() < 1e-2
+
+    def test_moderate_budget_close_to_dense(self):
+        q, k, v, scale = _rand_qkv(K=2048, L=512)
+        heads = [HeadPattern("vertical_slash", sink=64, window=128)] * 8
+        out = sparse_prefill_attention(q, k, v, scale, heads, budget=0.3)
+        ref = _dense_causal(q, k, v, scale)
+        assert bool(mx.isfinite(out).all().item())
+        assert mx.abs(out - ref).mean().item() < 0.05
+
+    def test_falls_back_when_sink_not_causal(self):
+        """First chunk (q_start = 0 < sink) must return None."""
+        import omlx.patches.sparse_prefill as sp
+
+        q, k, v, scale = _rand_qkv(K=512, L=512)
+        heads = [HeadPattern("vertical_slash", sink=64, window=128)] * 8
+        out = sp._maskless_attention(q, k, v, scale, heads, budget=0.3,
+                                     query_block=256)
+        assert out is None
+
+    def test_chunk_offset_positions(self):
+        """Maskless path attends at correct absolute positions: uniform
+        a_shape-equivalent config (no columns) matches Stage-1 exactly when
+        query_block granularity is aligned to a single block."""
+        import omlx.patches.sparse_prefill as sp
+
+        q, k, v, scale = _rand_qkv(K=2048, L=128)
+        # budget too small for columns -> pure sink+window, one block
+        heads = [HeadPattern("a_shape", sink=64, window=256)] * 8
+        out = sp._maskless_attention(q, k, v, scale, heads, budget=0.05,
+                                     query_block=128)
+        assert out is not None
+        # Reference: numpy masked softmax over sink + block window slice
+        qn = np.array(q, dtype=np.float32)
+        kn = np.repeat(np.array(k, dtype=np.float32), 2, axis=1)
+        vn = np.repeat(np.array(v, dtype=np.float32), 2, axis=1)
+        K, L, S, W = 2048, 128, 64, 256
+        pos = np.arange(K - L, K)
+        col = np.arange(K)
+        p0 = K - L
+        w0 = max(S, p0 - W + 1)
+        allowed = (col[None, :] <= pos[:, None]) & (
+            (col[None, :] < S) | (col[None, :] >= w0)
+        )
+        scores = qn @ kn.transpose(0, 1, 3, 2) * scale
+        scores = np.where(allowed[None, None], scores, -np.inf)
+        weights = np.exp(scores - scores.max(-1, keepdims=True))
+        weights /= weights.sum(-1, keepdims=True)
+        ref = weights @ vn
+        assert np.abs(np.array(out, dtype=np.float32) - ref).max() < 5e-3
 
 
 class TestEstimator:

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # estimate (MInference uses the last 64 queries).
 _N_ESTIMATE_ROWS = 64
 # Query rows processed per sparse-attention block.
-_QUERY_BLOCK = 512
+_QUERY_BLOCK = 1024
 # Minimum q_len for the sparse path; shorter forwards (decode, speculative
 # verify blocks) fall through to dense attention.
 _MIN_SPARSE_QLEN = 128
@@ -97,6 +97,16 @@ class _SparsePrefillState:
 _STATE = _SparsePrefillState()
 _PATCHED = False
 _ORIGINAL_SDPA = None
+
+# Preferred fast path: maskless block SDPA (_maskless_attention), which
+# rides MLX's fused flash kernel. The custom Metal kernel (Stage-2,
+# omlx/custom_kernels/sparse_prefill) is numerically validated but measured
+# *slower* than dense SDPA on M1 (scalar dot products cannot compete with
+# simdgroup-matrix flash attention) — kept for reference/tests, off by
+# default. See the plan doc's Stage-2 results.
+_USE_MASKLESS = True
+_USE_KERNEL = False
+_KERNEL_MAX_HEAD_DIM = 128
 
 
 def get_stats() -> Dict[str, Any]:
@@ -237,6 +247,155 @@ def estimate_vertical_columns(
     return mx.sort(top, axis=-1).astype(mx.int32)
 
 
+def _capped_row_sum(p0: int, p1: int, cap: int) -> int:
+    """Sum of min(p + 1, cap) for absolute row positions p in [p0, p1)."""
+    if cap <= 0:
+        return 0
+    hi = min(cap, p1)  # rows with p + 1 <= cap have p < cap
+    n_ramp = max(0, hi - p0)
+    ramp = (p0 + 1 + hi) * n_ramp // 2 if n_ramp else 0
+    return ramp + (p1 - p0 - n_ramp) * cap
+
+
+def _maskless_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    scale: float,
+    head_patterns: List[HeadPattern],
+    budget: float,
+    query_block: int,
+) -> Optional[mx.array]:
+    """Maskless sparse path: per query block, run stock (flash) SDPA over
+    [sink | vertical cols | window slice] with mask="causal".
+
+    Uses the layer-max sink/window (superset of every head's own pattern,
+    so recall only improves) and estimates vertical columns over the strictly
+    causal zone [S, q_start - W + 1) only — every key column before the
+    window slice is then valid for all rows, and the bottom-right-aligned
+    "causal" mask handles the window diagonal exactly. No boolean mask is
+    materialized and MLX's fused SDPA kernel does all the work.
+
+    Returns None when preconditions fail (first rows would need sink
+    masking), falling back to the Stage-1 masked path.
+    """
+    B, n_q_heads, L, D = queries.shape
+    n_kv_heads = keys.shape[1]
+    K = keys.shape[-2]
+
+    S = max(h.sink for h in head_patterns)
+    W = max(h.window for h in head_patterns)
+    q_start = K - L
+    w0_global = max(S, q_start - W + 1)
+    if q_start < S or w0_global <= S:
+        return None  # sink/window not fully causal or no column zone
+
+    budget_keys = int(budget * K)
+    n_cols = max(0, budget_keys - S - W)
+    n_cols = min(n_cols, w0_global - S)
+
+    if n_cols > 0 and any(h.kind == "vertical_slash" for h in head_patterns):
+        # Column estimate restricted to [S, w0_global): all causal for the
+        # estimate rows (last rows of the chunk), so no mask is needed.
+        n_rows = min(_N_ESTIMATE_ROWS, L)
+        group = n_q_heads // n_kv_heads
+        q_est = queries[..., L - n_rows :, :].reshape(
+            B, n_kv_heads, group, n_rows, D
+        )
+        k_zone = keys[..., S:w0_global, :]
+        scores = (q_est @ k_zone[:, :, None].transpose(0, 1, 2, 4, 3)) * scale
+        col_mass = mx.softmax(scores, axis=-1).mean(axis=(0, 2, 3))  # (Hkv, Z)
+        Z = w0_global - S
+        top = mx.argpartition(col_mass, kth=Z - n_cols, axis=-1)[..., Z - n_cols :]
+        cols = mx.sort(top, axis=-1).astype(mx.int32) + S  # (Hkv, C)
+        col_idx = cols[None, :, :, None]
+        k_cols = mx.take_along_axis(keys, col_idx, axis=2)
+        v_cols = mx.take_along_axis(values, col_idx, axis=2)
+    else:
+        n_cols = 0
+        k_cols = v_cols = None
+
+    k_sink = keys[..., :S, :]
+    v_sink = values[..., :S, :]
+
+    out_blocks = []
+    for r0 in range(0, L, query_block):
+        r1 = min(r0 + query_block, L)
+        p0 = q_start + r0
+        p1 = q_start + r1
+        w0 = max(S, p0 - W + 1)
+
+        parts_k = [k_sink]
+        parts_v = [v_sink]
+        if k_cols is not None:
+            parts_k.append(k_cols)
+            parts_v.append(v_cols)
+        parts_k.append(keys[..., w0:p1, :])
+        parts_v.append(values[..., w0:p1, :])
+
+        out_b = mx.fast.scaled_dot_product_attention(
+            queries[..., r0:r1, :],
+            mx.concatenate(parts_k, axis=2),
+            mx.concatenate(parts_v, axis=2),
+            scale=scale,
+            mask="causal",
+        )
+        out_blocks.append(out_b)
+        _STATE.keys_attended += (S + n_cols + (p1 - w0)) * (r1 - r0)
+
+    _STATE.keys_total += K * L
+    return mx.concatenate(out_blocks, axis=2)
+
+
+def _fused_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    scale: float,
+    head_patterns: List[HeadPattern],
+    cols: Optional[mx.array],
+    n_cols: int,
+) -> Optional[mx.array]:
+    """Stage-2 fused Metal kernel path; returns None on unavailability."""
+    global _USE_KERNEL
+    from ..custom_kernels import sparse_prefill as _kernels
+
+    if not _kernels.is_available():
+        return None
+
+    B, n_q_heads, L, _D = queries.shape
+    K = keys.shape[-2]
+    sink_arr = mx.array([h.sink for h in head_patterns], dtype=mx.int32)
+    window_arr = mx.array([h.window for h in head_patterns], dtype=mx.int32)
+    has_cols = mx.array(
+        [int(h.kind == "vertical_slash" and n_cols > 0) for h in head_patterns],
+        dtype=mx.int32,
+    )
+    try:
+        out = _kernels.vertical_slash_attention(
+            queries, keys, values, cols, sink_arr, window_arr, has_cols, scale
+        )
+    except Exception:
+        _USE_KERNEL = False
+        logger.warning(
+            "fused sparse prefill kernel failed; using Stage-1 path",
+            exc_info=True,
+        )
+        return None
+
+    # Analytic per-head attended-key estimate (upper bound, ignores
+    # column/sink/window dedup — same coarse spirit as the Stage-1 count).
+    p0 = K - L
+    attended = 0
+    for h in head_patterns:
+        cap = h.sink + h.window + (n_cols if h.kind == "vertical_slash" else 0)
+        attended += _capped_row_sum(p0, K, cap)
+    # Same units as the Stage-1 count: head-averaged keys per (row, layer).
+    _STATE.keys_attended += attended // n_q_heads
+    _STATE.keys_total += K * L
+    return out
+
+
 def sparse_prefill_attention(
     queries: mx.array,
     keys: mx.array,
@@ -275,8 +434,26 @@ def sparse_prefill_attention(
             n_cols = max(n_cols, budget_keys - h.sink - h.window)
     n_cols = max(0, min(n_cols, K - sink_star))
 
+    if _USE_MASKLESS:
+        out = _maskless_attention(
+            queries, keys, values, scale, head_patterns, budget, query_block
+        )
+        if out is not None:
+            return out
+
     if n_cols > 0:
         cols = estimate_vertical_columns(queries, keys, scale, n_cols)  # (Hkv, C)
+    else:
+        cols = None
+
+    if _USE_KERNEL and D % 32 == 0 and D <= _KERNEL_MAX_HEAD_DIM:
+        out = _fused_attention(
+            queries, keys, values, scale, head_patterns, cols, n_cols
+        )
+        if out is not None:
+            return out
+
+    if cols is not None:
         # (B, Hkv, C, D) gathers of the vertical columns
         col_idx = cols[None, :, :, None]
         k_cols = mx.take_along_axis(keys, col_idx, axis=2)
@@ -351,18 +528,20 @@ def sparse_prefill_attention(
         rows = pos_r[None, None, :, None]  # (1, 1, lb, 1)
 
         causal = cp <= rows
-        # Deduplicate: a vertical-column entry that falls inside the sink or
-        # the block's window slice would appear twice in k_b.
-        dup = region_cols[None, None, None, :] & (
-            (cp < sink_star) | (cp >= w_start)
-        )
 
         sink_h = sink_arr.reshape(n_kv_heads, group, 1, 1)
         window_h = window_arr.reshape(n_kv_heads, group, 1, 1)
         vs_h = is_vs.reshape(n_kv_heads, group, 1, 1)
 
-        pattern_ok = vs_h | (cp < sink_h) | (cp > rows - window_h)
-        allowed = (causal & ~dup) & pattern_ok
+        # base: this position lies in the head's own sink or window. The
+        # shared sink*/window* slices may contain positions beyond a head's
+        # own sizes — those are only reachable as vertical columns. A
+        # vertical-column entry is allowed exactly when the same position
+        # is NOT in base (else the physical sink/window entry covers it and
+        # keeping both would double count the key in the softmax).
+        base = (cp < sink_h) | (cp > rows - window_h)
+        in_cols = region_cols[None, None, None, :]
+        allowed = causal & mx.where(in_cols, vs_h & ~base, base)
         mask = allowed.reshape(1, n_q_heads, lb, c_tot)
 
         out_b = mx.fast.scaled_dot_product_attention(

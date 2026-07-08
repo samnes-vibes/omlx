@@ -2,7 +2,7 @@
 
 Date: 2026-07-06
 Suggested branch: `feat/sparse-prefill-draftfree`
-Status: **implemented through Phase 2 (Stage-1 kernels)** — see "Results (2026-07-09)" at the end.
+Status: **implemented through Phase 2 (Stage-1 kernels); Phase 3 (Stage-2 Metal kernel) greenlit** — see the two Results sections at the end.
 Originally planned as item B1, ranked #4 in [5x_speedup_research.md](5x_speedup_research.md) recommended order.
 Companion to: [ngram_speculation_plan.md](ngram_speculation_plan.md) (template & precedent),
 [MInference](https://openreview.net/forum?id=fPBACAbqSN)
@@ -229,3 +229,100 @@ Metal kernel would sharpen 1.17x to maybe 1.5x — worth doing only after
 benchmarking on a full-attention model (e.g. Llama-3.2-1B) where all layers
 benefit and calibrated budgets can be lower. Feature stays opt-in
 (`sparse_prefill_enabled=False` default), exactly as planned.
+
+## Results (2026-07-08, full-attention model: Llama-3.2-1B-Instruct-4bit)
+
+Follow-up to the assessment above: re-ran calibration + benchmark on a
+full-attention model (all 16 layers, 32 q-heads each) to remove the hybrid
+Amdahl cap and test whether lower budgets calibrate.
+
+### Calibration (2×16K prompts)
+
+Full-attention Llama is far sparser than the hybrid 0.8B Qwen: recall
+@ budget 0.1 → 0.863 (just under gate), **0.15 → 0.902 (gate passed)**,
+0.2 → 0.927. All 512 heads fitted vertical_slash at 0.15
+(509 vertical_slash / 3 a_shape at 0.1). Compare Qwen needing budget 0.4.
+
+### Prefill benchmark (chunked 2048, budget 0.15, threshold 8192)
+
+`scripts/sparse_prefill_bench.py`, M1 8 GB:
+
+| tokens | dense s | sparse s | speedup | effective density | needle d/s |
+|---|---|---|---|---|---|
+| 4 094  | 5.19  | 5.16  | 1.01x (gated off) | — | Y/Y |
+| 8 189  | 10.83 | 10.82 | 1.00x (gated off) | — | Y/Y |
+| 16 382 | 25.84 | 22.86 | **1.13x** | 0.203 | Y/Y |
+| 32 766 | 71.14 | 59.10 | **1.20x** | 0.182 | Y/Y |
+
+Needle retrieval (`TANGERINE-42`) correct dense and sparse at every length.
+
+### Stage-2 decision (Phase 3 gate)
+
+The Amdahl explanation is now eliminated: every layer is sparse-eligible and
+effective density is ~0.18, yet speedup is only 1.2x. The gap between the
+~5x theoretical attention-FLOP reduction and 1.2x wall-clock is therefore
+almost entirely **Stage-1 implementation overhead** (per-head boolean masks,
+`mx.take` column gathers, block-chunked SDPA launches) — exactly the
+bandwidth-bound behaviour the risk table predicted. Conclusion: the Stage-2
+fused vertical-slash Metal kernel is now clearly the binding constraint and
+is worth building (Phase 3 go). Vertical-slash-only is sufficient — it won
+960/1024 fitted heads across both models and 512/512 on Llama.
+
+## Results (2026-07-08, Phase 3 / Stage 2)
+
+Two Stage-2 implementations were built and measured on the Llama-3.2-1B
+setup above (budget 0.15, threshold 8192, chunked 2048, M1 8 GB):
+
+**1. Custom fused Metal kernel** (`omlx/custom_kernels/sparse_prefill/`,
+`mx.fast.metal_kernel` JIT — no native build). Flash-style blocked design:
+16 query rows per threadgroup share K/V tiles through threadgroup memory,
+online softmax with lane-distributed accumulators, per-row validity masks.
+Numerically correct (matches the Stage-1 reference to <5e-3 in fp16,
+matches dense exactly under full coverage) but **slower than dense SDPA**:
+0.6x/0.44x naive (one simdgroup per row), 0.76x/0.66x blocked, at 16K/32K.
+Root cause: scalar per-lane dot products cannot compete with MLX's
+simdgroup-matrix flash attention — the ~6x FLOP reduction is more than
+eaten by a >6x lower FLOP throughput. Getting ahead would require
+simdgroup_matrix tiles (a full flash-attention rewrite in Metal). The
+kernel is kept in-repo for reference/tests but disabled by default
+(`_USE_KERNEL = False`).
+
+**2. Maskless block-SDPA path** (`_maskless_attention`, now the default
+sparse path). Insight: with layer-max sink/window (a quality-safe superset
+of the per-head patterns) and vertical columns estimated only over the
+strictly-causal zone `[S, q_start − W + 1)`, every query block's key set
+`[sink | cols | window-slice]` needs **no materialized mask** — MLX's
+bottom-right-aligned `mask="causal"` handles the window diagonal exactly,
+and the whole computation rides the stock fused flash-SDPA kernel. This
+removed the Stage-1 boolean-mask overhead entirely:
+
+| tokens | dense s | sparse s | speedup | effective density | needle d/s |
+|---|---|---|---|---|---|
+| 8 189  | 10.98 | 11.05 | 0.99x (gated off) | — | Y/Y |
+| 16 382 | 26.01 | 20.10 | **1.29x** | 0.19 | Y/Y |
+| 32 766 | 71.14 | 42.88 | **1.66x** | 0.20 | Y/Y |
+| 65 534 | 298.2 | 120.0 | **2.49x** | 0.18 | Y/Y |
+
+(`_QUERY_BLOCK` raised 512 → 1024: 1.64x → 1.66x at 32K.) Needle retrieval
+correct dense and sparse at every length. Speedup grows with context
+exactly as the O(L²) → O(L·budget·L) model predicts; extrapolating, ≥3x
+lands around 96K+ tokens on this hardware.
+
+Also fixed while validating the kernel: Stage-1's mask semantics gave
+vertical_slash heads the layer-max sink/window at block granularity
+(a superset) and its column dedup was block-level, dropping some columns
+for late rows in a block. Both paths now implement the exact per-head
+pattern (per-row dedup); tests cover kernel-vs-reference, maskless-vs-dense
+saturation, chunk offsets, and first-chunk fallback (21 pass).
+
+### Remaining gaps to the 3–10x target
+
+- The maskless path attends the *union* pattern per layer (max sink/window),
+  so effective density (~0.18–0.20) sits above the calibrated 0.15.
+- Block-sparse pattern class and simdgroup-matrix custom kernel remain
+  unimplemented — the latter is the only route to paper-level speedups at
+  16–32K, and is a large standalone effort (essentially flash attention
+  with gather in Metal).
+- On ≥7B full-attention models the calibrated budget should drop well below
+  0.15 (MInference's regime), improving all numbers; not testable on the
+  8 GB box.
