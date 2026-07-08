@@ -45,6 +45,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
     "turboquant_kv_bits",
     "turboquant_skip_last",
+    "turboquant_fused_kernel",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",

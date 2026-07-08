@@ -83,6 +83,36 @@ def apply_turboquant_attention_patch() -> bool:
                     scale=scale,
                     mask=mask,
                 )
+            # Verify-length (2..32) speculative forwards: fused compressed-domain
+            # kernel for the MSE codec (default integer bits). mlx-vlm's
+            # prefill_attention only covers the Prod key codec, so without this
+            # the verify path dequantizes the full fp16 KV every step.
+            if 1 < queries.shape[-2] <= 32:
+                from ..custom_kernels.tq_attention import (
+                    fused_verify_attention,
+                    is_enabled as _tq_fused_enabled,
+                )
+
+                if _tq_fused_enabled():
+                    try:
+                        result = fused_verify_attention(
+                            real_cache,
+                            queries,
+                            keys,
+                            values,
+                            scale=scale,
+                            mask=mask,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "TurboQuant fused verify attention failed; "
+                            "falling back",
+                            exc_info=True,
+                        )
+                        result = None
+                    if result is not None:
+                        return result
+
             # Prefill: try quantized fast path, fallback to dequantize+SDPA
             result = real_cache.prefill_attention(
                 queries,

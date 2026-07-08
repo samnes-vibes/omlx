@@ -301,6 +301,11 @@ class BatchedEngine(BaseEngine):
                 )
 
                 apply_turboquant_attention_patch()
+                from ..custom_kernels.tq_attention import set_enabled as _tq_fused
+
+                _tq_fused(
+                    getattr(self._model_settings, "turboquant_fused_kernel", True)
+                )
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 

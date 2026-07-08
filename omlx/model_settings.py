@@ -147,6 +147,9 @@ class ModelSettings:
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
+    turboquant_fused_kernel: bool = (
+        True  # Fused compressed-domain verify attention (q_len 2-32); kill switch
+    )
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
