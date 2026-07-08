@@ -326,3 +326,24 @@ saturation, chunk offsets, and first-chunk fallback (21 pass).
 - On ≥7B full-attention models the calibrated budget should drop well below
   0.15 (MInference's regime), improving all numbers; not testable on the
   8 GB box.
+
+## Next steps (2026-07-08, priority order)
+
+- [ ] **End-to-end validation through the real server** (Phase 4 precursor):
+      run `scripts/perf_bench.py --ab --setting-key sparse_prefill_enabled
+      --scenario long_context` against a running oMLX server with
+      Llama-3.2-1B + the b0.15 calibration. Verifies BatchedEngine
+      activation, chunked prefill, prefix-cache and settings validation in
+      the actual serving path, and that the standalone-script speedups
+      (1.29–2.49x) survive there. Surface `get_stats()` via an admin
+      endpoint for `--stats-path` while at it.
+- [ ] **Widen the quality gate beyond the single needle probe**: a light
+      multi-question long-context QA set (10–20 questions at varied depths,
+      dense-vs-sparse answer agreement) before recommending the feature as
+      a per-profile default anywhere.
+- [ ] **Only then, big-ticket items** (gated on access to a bigger box +
+      ≥7B full-attention model, where calibrated budget should drop to
+      ~0.1): simdgroup-matrix custom kernel (the only route to paper-level
+      3–10x at 16–32K; measured here that scalar Metal kernels lose to
+      MLX's flash SDPA), block_sparse pattern class, admin-panel
+      calibration job button, SpecPrefill deprecation decision.
