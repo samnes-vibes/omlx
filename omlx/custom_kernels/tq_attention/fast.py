@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 _ENABLED = True
 _MAX_VERIFY_LEN = 32
+# The value kernel unrolls RepeatCount accumulator registers and spills past
+# ~64; larger R·L is served by chunking the query rows across dispatches.
+_VALUE_ROW_CHUNK = 64
 
 
 def set_enabled(flag: bool) -> None:
@@ -175,10 +178,20 @@ def fused_verify_attention(
     score_kernel = _multi_query_mse_score_kernel(
         key_bits, n_repeats, L, dims_per_lane
     )
-    val_kernel = _single_tile_value_weighted_sum_kernel(
-        val_bits, n_repeats * L, val_dims_per_lane
-    )
-    if score_kernel is None or val_kernel is None:
+    total_rows = n_repeats * L
+    num_row_chunks = (total_rows + _VALUE_ROW_CHUNK - 1) // _VALUE_ROW_CHUNK
+    # Even split keeps every dispatch under the register-spill threshold
+    # while compiling at most two kernel variants (rows_per_chunk and the
+    # remainder chunk).
+    rows_per_chunk = (total_rows + num_row_chunks - 1) // num_row_chunks
+    val_kernels = {}
+    for start in range(0, total_rows, rows_per_chunk):
+        rows = min(rows_per_chunk, total_rows - start)
+        if rows not in val_kernels:
+            val_kernels[rows] = _single_tile_value_weighted_sum_kernel(
+                val_bits, rows, val_dims_per_lane
+            )
+    if score_kernel is None or any(k is None for k in val_kernels.values()):
         return None
 
     dtype = queries.dtype
@@ -214,33 +227,43 @@ def fused_verify_attention(
 
     tok_tile_size = 1024
     num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
-    out_tiled = val_kernel(
-        inputs=[
-            weights,
-            values_state.norms,
-            values_state.indices,
-            cache.value_codec.codebook,
-        ],
-        template=[
-            ("Dim", value_dim),
-            ("RepeatCount", n_repeats * L),
-            ("TokTileSize", tok_tile_size),
-            ("DimsPerLane", val_dims_per_lane),
-            ("PackedWidth", values_state.indices.shape[-1]),
-        ],
-        grid=(value_dim, 1, B * n_kv_heads * num_tok_tiles),
-        threadgroup=(value_dim, 1, 1),
-        output_shapes=[
-            (B * n_kv_heads * num_tok_tiles, n_repeats * L, value_dim)
-        ],
-        output_dtypes=[mx.float32],
-    )[0]
+    chunk_outs = []
+    for start in range(0, total_rows, rows_per_chunk):
+        rows = min(rows_per_chunk, total_rows - start)
+        chunk_weights = (
+            weights
+            if rows == total_rows
+            else weights[:, start : start + rows, :]
+        )
+        out_tiled = val_kernels[rows](
+            inputs=[
+                chunk_weights,
+                values_state.norms,
+                values_state.indices,
+                cache.value_codec.codebook,
+            ],
+            template=[
+                ("Dim", value_dim),
+                ("RepeatCount", rows),
+                ("TokTileSize", tok_tile_size),
+                ("DimsPerLane", val_dims_per_lane),
+                ("PackedWidth", values_state.indices.shape[-1]),
+            ],
+            grid=(value_dim, 1, B * n_kv_heads * num_tok_tiles),
+            threadgroup=(value_dim, 1, 1),
+            output_shapes=[(B * n_kv_heads * num_tok_tiles, rows, value_dim)],
+            output_dtypes=[mx.float32],
+        )[0].reshape(B * n_kv_heads, num_tok_tiles, rows, value_dim)
+        chunk_outs.append(
+            mx.sum(out_tiled, axis=1)
+            if num_tok_tiles > 1
+            else out_tiled.squeeze(1)
+        )
 
-    out_tiled = out_tiled.reshape(
-        B * n_kv_heads, num_tok_tiles, n_repeats * L, value_dim
-    )
     out_rotated = (
-        mx.sum(out_tiled, axis=1) if num_tok_tiles > 1 else out_tiled.squeeze(1)
+        mx.concatenate(chunk_outs, axis=1)
+        if len(chunk_outs) > 1
+        else chunk_outs[0]
     )
     out_rotated = out_rotated.reshape(B, n_kv_heads, n_repeats, L, value_dim)
     output = cache.value_codec._rotate_inverse(out_rotated)

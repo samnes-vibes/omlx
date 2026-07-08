@@ -187,3 +187,22 @@ not required).
    kernel's one-simdgroup-per-(token, repeat) layout has poor occupancy and
    is the next thing to attack. Phase 3 end-to-end A/B
    (`perf_bench.py --ab --setting-key turboquant_fused_kernel`) not yet run.
+8. **Query-chunked value dispatch (2026-07-08): implemented, gate unchanged.**
+   Splitting the R·L weight rows into ≤64-row value-kernel dispatches removes
+   the register spill (M-class, GQA-8, T=8K: L=16 47→20 ms, L=32 132→38 ms
+   forced) — but the fused path stays ~linear in R·L while the dequant path
+   is ~flat in L (dequant cost dominates, independent of q_len), so chunking
+   never crosses 1x beyond R·L=64 (0.5x at L=16, 0.28x at L=32, all T up to
+   32K). The profitability gate is therefore unchanged; chunking is kept as
+   a mitigation for forced/benchmark paths and as the substrate a faster
+   score kernel would build on. Conclusion: extending the gate to L ≥ 16
+   requires attacking per-element efficiency (flash-style tiled kernel with
+   simdgroup matrix ops), not dispatch shape — the current scalar
+   simd_sum inner loop cannot match fp16 SDPA's matmul throughput once
+   dequant's fixed cost is amortized over many query rows.
+9. **Phase 3 blocker:** end-to-end A/B needs a speculation feature to
+   produce q_len>1 verify forwards. On this branch that means DFlash
+   (ngram-spec lives on its own branch; MTP is mutually exclusive with
+   turboquant), and DFlash needs a draft checkpoint for a matching target
+   model — not present on the dev machine (only ≤1B toy models cached).
+   Blocked on choosing a bench model + downloading its DFlash draft.
