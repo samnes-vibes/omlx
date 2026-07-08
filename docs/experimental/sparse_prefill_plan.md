@@ -327,16 +327,39 @@ saturation, chunk offsets, and first-chunk fallback (21 pass).
   0.15 (MInference's regime), improving all numbers; not testable on the
   8 GB box.
 
+## Results (2026-07-08, E2E through the real server)
+
+Ran `scripts/perf_bench.py --ab --setting-key sparse_prefill_enabled
+--scenario long_context --cache-bust --stats-path
+admin/api/sparse-prefill/stats` against a live oMLX server
+(Llama-3.2-1B-Instruct-4bit, b0.15 calibration, chunked prefill on,
+M1 8 GB). Infrastructure added for this:
+
+- Admin API: `sparse_prefill_enabled/threshold/budget/calibration_file` in
+  `PUT /admin/api/models/{id}/settings` (validates calibration-file
+  existence and SpecPrefill mutex; toggling triggers engine reload), plus
+  `GET /admin/api/sparse-prefill/stats?reset=1`.
+- `BatchedEngine` now deactivates the module-level sparse state when a
+  model loads with the feature off (reload-with-disabled actually disables).
+- `perf_bench.py --cache-bust`: unique nonce per request so the server's
+  prefix cache cannot skip prefill — without it the A/B is meaningless.
+  `long_context` doc trimmed to ~16.4K tokens (29.7K hit the 8 GB
+  prefill memory guard on back-to-back runs).
+
+Result at 16.4K tokens (median of 2, after warmup): TTFT dense 27.1 s →
+sparse **19.4 s = 1.40x**, server-side stats `sparse_calls=336,
+effective_density=0.223`. Matches/beats the standalone-script 1.29x at
+16K — activation, chunked prefill, settings validation and stats all work
+in the real serving path. (The tok/s column of the A/B is noise: 5-token
+completions.) Bug found & fixed along the way: function-local
+`from pathlib import Path` imports in `update_model_settings` shadowed the
+module import and 500'd the new validation.
+
 ## Next steps (2026-07-08, priority order)
 
-- [ ] **End-to-end validation through the real server** (Phase 4 precursor):
-      run `scripts/perf_bench.py --ab --setting-key sparse_prefill_enabled
-      --scenario long_context` against a running oMLX server with
-      Llama-3.2-1B + the b0.15 calibration. Verifies BatchedEngine
-      activation, chunked prefill, prefix-cache and settings validation in
-      the actual serving path, and that the standalone-script speedups
-      (1.29–2.49x) survive there. Surface `get_stats()` via an admin
-      endpoint for `--stats-path` while at it.
+- [x] **End-to-end validation through the real server** — done, see
+      Results above (1.40x TTFT at 16.4K through the serving path;
+      admin stats endpoint added).
 - [ ] **Widen the quality gate beyond the single needle probe**: a light
       multi-question long-context QA set (10–20 questions at varied depths,
       dense-vs-sparse answer agreement) before recommending the feature as

@@ -113,6 +113,14 @@ def get_stats() -> Dict[str, Any]:
     return _STATE.stats()
 
 
+def reset_stats() -> None:
+    """Zero the call/key counters (config and patterns are untouched)."""
+    _STATE.sparse_calls = 0
+    _STATE.dense_calls = 0
+    _STATE.keys_attended = 0
+    _STATE.keys_total = 0
+
+
 # ---------------------------------------------------------------------------
 # Calibration file loading
 # ---------------------------------------------------------------------------

@@ -71,7 +71,7 @@ _CODE = '''def process_records(records, filters, transform=None):
     return results
 '''
 
-def _long_context_doc(approx_words: int = 20000) -> str:
+def _long_context_doc(approx_words: int = 11000) -> str:
     """Deterministic aperiodic long document (~16K+ tokens) for the
     long_context scenario — the length regime sparse prefill targets."""
     import random
@@ -212,11 +212,19 @@ def _post_json(url, payload, token=None):
 # ---------------------------------------------------------------------------
 
 
-def run_streaming_completion(base_url, model, scenario, token=None):
+def run_streaming_completion(base_url, model, scenario, token=None, cache_bust=False):
     """One streaming chat completion; returns (ttft_s, decode_s, n_tokens)."""
+    messages = scenario["messages"]
+    if cache_bust:
+        # Unique text at the *start* of the first message changes the token
+        # prefix, so the server's prefix cache cannot skip any prefill work.
+        import uuid
+
+        messages = [dict(m) for m in messages]
+        messages[0]["content"] = f"[bench {uuid.uuid4().hex}]\n{messages[0]['content']}"
     payload = {
         "model": model,
-        "messages": scenario["messages"],
+        "messages": messages,
         "max_tokens": scenario["max_tokens"],
         "temperature": 0,
         "stream": True,
@@ -254,14 +262,16 @@ def run_streaming_completion(base_url, model, scenario, token=None):
     return ttft, max(total - ttft, 1e-9), n_tokens
 
 
-def run_scenario(base_url, model, name, runs, warmup, token=None):
+def run_scenario(base_url, model, name, runs, warmup, token=None, cache_bust=False):
     scenario = SCENARIOS[name]
     for _ in range(warmup):
-        run_streaming_completion(base_url, model, scenario, token=token)
+        run_streaming_completion(
+            base_url, model, scenario, token=token, cache_bust=cache_bust
+        )
     ttfts, rates, tokens = [], [], []
     for i in range(runs):
         ttft, decode_s, n = run_streaming_completion(
-            base_url, model, scenario, token=token
+            base_url, model, scenario, token=token, cache_bust=cache_bust
         )
         ttfts.append(ttft)
         rates.append(n / decode_s)
@@ -308,13 +318,14 @@ def summarize_stats(stats):
     return ", ".join(f"{k}={v}" for k, v in stats.items())
 
 
-def run_pass(base_url, model, scenarios, runs, warmup, stats_path, token=None):
+def run_pass(base_url, model, scenarios, runs, warmup, stats_path, token=None,
+             cache_bust=False):
     results = {}
     for name in scenarios:
         print(f"  scenario: {name}")
         fetch_admin_stats(base_url, stats_path, token=token, reset=True)
         results[name] = run_scenario(
-            base_url, model, name, runs, warmup, token=token
+            base_url, model, name, runs, warmup, token=token, cache_bust=cache_bust
         )
         results[name]["stats"] = fetch_admin_stats(base_url, stats_path, token=token)
         print(f"    stats: {summarize_stats(results[name]['stats'])}")
@@ -365,6 +376,12 @@ def main():
         default=None,
         help="admin API path for feature stats, e.g. admin/api/ngram-spec/stats",
     )
+    ap.add_argument(
+        "--cache-bust",
+        action="store_true",
+        help="prepend a unique nonce to each request so the server's prefix "
+        "cache never skips prefill (required for TTFT/prefill A/Bs)",
+    )
     ap.add_argument("--json", action="store_true", help="emit raw JSON results")
     args = ap.parse_args()
 
@@ -389,18 +406,19 @@ def main():
         set_setting_enabled(args.base_url, args.model, args.setting_key, False, token=token)
         time.sleep(2)
         off = run_pass(args.base_url, args.model, scenarios, args.runs, args.warmup,
-                        args.stats_path, token)
+                        args.stats_path, token, cache_bust=args.cache_bust)
         print(f"\n== pass 2: {args.setting_key} ON ==")
         set_setting_enabled(args.base_url, args.model, args.setting_key, True, token=token)
         time.sleep(2)
         on = run_pass(args.base_url, args.model, scenarios, args.runs, args.warmup,
-                       args.stats_path, token)
+                       args.stats_path, token, cache_bust=args.cache_bust)
         print_comparison(off, on)
         if args.json:
             print(json.dumps({"off": off, "on": on}, indent=2))
     else:
         results = run_pass(args.base_url, args.model, scenarios, args.runs,
-                            args.warmup, args.stats_path, token)
+                            args.warmup, args.stats_path, token,
+                            cache_bust=args.cache_bust)
         for name, r in results.items():
             print(
                 f"{name:<12} ttft {r['ttft_ms']:.0f} ms, "

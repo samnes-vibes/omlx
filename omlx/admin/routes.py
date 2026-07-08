@@ -128,6 +128,11 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: str | None = None
     specprefill_keep_pct: float | None = None
     specprefill_threshold: int | None = None
+    # Draft-free sparse prefill (experimental, MInference-style)
+    sparse_prefill_enabled: bool | None = None
+    sparse_prefill_threshold: int | None = None
+    sparse_prefill_budget: float | None = None
+    sparse_prefill_calibration_file: str | None = None
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool | None = None
     dflash_draft_model: str | None = None
@@ -2168,8 +2173,6 @@ async def update_model_settings(
             entry.engine_type = type_to_engine.get(override_value, "batched")
         else:
             # Reset to auto-detected type
-            from pathlib import Path
-
             from ..model_discovery import detect_model_type
 
             detected_type = detect_model_type(Path(entry.model_path))
@@ -2241,6 +2244,50 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    # Draft-free sparse prefill settings
+    if "sparse_prefill_calibration_file" in sent:
+        current_settings.sparse_prefill_calibration_file = (
+            request.sparse_prefill_calibration_file or None
+        )
+    if "sparse_prefill_enabled" in sent:
+        new_sparse_prefill = bool(request.sparse_prefill_enabled)
+        if new_sparse_prefill:
+            spec_after = (
+                bool(request.specprefill_enabled)
+                if "specprefill_enabled" in sent
+                else current_settings.specprefill_enabled
+            )
+            if spec_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "sparse_prefill_enabled and specprefill_enabled cannot "
+                        "both be enabled; choose one sparse-prefill path."
+                    ),
+                )
+            from ..patches.sparse_prefill import default_calibration_path
+
+            calib_path = Path(
+                current_settings.sparse_prefill_calibration_file
+                or default_calibration_path(model_id)
+            ).expanduser()
+            if not calib_path.exists():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Sparse prefill requires a calibration file "
+                        f"(looked at {calib_path}). Run "
+                        f"'python -m omlx.sparse_calibration --model {model_id}' "
+                        "first."
+                    ),
+                )
+        current_settings.sparse_prefill_enabled = new_sparse_prefill
+    if "sparse_prefill_threshold" in sent:
+        current_settings.sparse_prefill_threshold = (
+            request.sparse_prefill_threshold or None
+        )
+    if "sparse_prefill_budget" in sent:
+        current_settings.sparse_prefill_budget = request.sparse_prefill_budget or None
     # DFlash settings
     if "dflash_enabled" in sent:
         new_dflash_enabled = (
@@ -2360,7 +2407,6 @@ async def update_model_settings(
             # the one that catches mlx-community converted weights where the
             # default sanitize path stripped the MTP heads.
             import json
-            from pathlib import Path
 
             from ..utils.model_loading import _is_mtp_compatible
 
@@ -2546,6 +2592,11 @@ async def update_model_settings(
         ("model_type_override" in sent and entry.engine_type != prev_engine_type)
         or "index_cache_freq" in sent
         or "dflash_enabled" in sent
+        # Sparse prefill is activated in BatchedEngine at model load
+        or "sparse_prefill_enabled" in sent
+        or "sparse_prefill_threshold" in sent
+        or "sparse_prefill_budget" in sent
+        or "sparse_prefill_calibration_file" in sent
         or "dflash_draft_model" in sent
         or "dflash_draft_quant_enabled" in sent
         or "dflash_draft_quant_weight_bits" in sent
@@ -2591,6 +2642,25 @@ async def update_model_settings(
         "auto_unloaded": auto_unloaded,
         "auto_reloaded": auto_reloaded,
     }
+
+
+@router.get("/api/sparse-prefill/stats")
+async def sparse_prefill_stats(
+    reset: bool = False,
+    is_admin: bool = Depends(require_admin),
+):
+    """Runtime stats for the draft-free sparse prefill patch.
+
+    Module-level (the patch is process-wide, active for the currently loaded
+    model that enabled it). Pass ?reset=1 to zero the counters after reading —
+    used by scripts/perf_bench.py --stats-path between A/B passes.
+    """
+    from ..patches.sparse_prefill import get_stats, reset_stats
+
+    stats = get_stats()
+    if reset:
+        reset_stats()
+    return stats
 
 
 # =============================================================================

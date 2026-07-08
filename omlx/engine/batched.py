@@ -318,6 +318,15 @@ class BatchedEngine(BaseEngine):
                 )
             except Exception:
                 logger.warning("Sparse prefill activation failed", exc_info=True)
+        else:
+            # A previous engine in this process may have left the module-level
+            # state enabled; make reload-with-disabled actually disable it.
+            try:
+                from ..patches.sparse_prefill import deactivate_sparse_prefill
+
+                deactivate_sparse_prefill()
+            except Exception:
+                pass
 
         # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
         # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
