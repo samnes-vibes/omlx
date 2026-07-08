@@ -65,6 +65,10 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
+        sparse_prefill_enabled: Enable draft-free sparse prefill (experimental).
+        sparse_prefill_threshold: Min context tokens for sparse prefill.
+        sparse_prefill_budget: Attention FLOP budget fraction (default 0.1).
+        sparse_prefill_calibration_file: Per-head pattern JSON path.
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_enabled: Enable draft model quantization.
@@ -156,6 +160,16 @@ class ModelSettings:
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
+    # Sparse prefill (experimental: draft-free MInference-style sparse attention
+    # at prefill time; needs a calibration file from omlx.sparse_calibration).
+    # Mutually exclusive with specprefill (both reshape prefill attention).
+    sparse_prefill_enabled: bool = False
+    sparse_prefill_threshold: Optional[int] = None  # Min context tokens (default 8192)
+    sparse_prefill_budget: Optional[float] = None  # Attention FLOP fraction (default 0.1)
+    sparse_prefill_calibration_file: Optional[str] = (
+        None  # Default: ~/.omlx/sparse_prefill/<model>.json
+    )
+
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
@@ -233,6 +247,13 @@ class ModelSettings:
             raise ValueError(
                 "mtp_enabled and turboquant_kv_enabled cannot both be True; "
                 "TurboQuant patches the attention path that MTP relies on"
+            )
+        # Both sparse-prefill features reshape prefill attention over the same
+        # seam; running both would compound their approximations unpredictably.
+        if self.sparse_prefill_enabled and self.specprefill_enabled:
+            raise ValueError(
+                "sparse_prefill_enabled and specprefill_enabled cannot both be "
+                "True; choose one sparse-prefill path per model"
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path

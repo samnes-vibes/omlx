@@ -304,6 +304,21 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
+        # Draft-free sparse prefill (MInference-style): per-head sparse
+        # attention patterns during long prefill, from an offline calibration
+        # file. See docs/experimental/sparse_prefill_plan.md.
+        if self._model_settings is not None and getattr(
+            self._model_settings, "sparse_prefill_enabled", False
+        ):
+            try:
+                from ..patches.sparse_prefill import activate_sparse_prefill
+
+                activate_sparse_prefill(
+                    self._model, self._model_settings, self._model_name
+                )
+            except Exception:
+                logger.warning("Sparse prefill activation failed", exc_info=True)
+
         # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
         # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
         # below their context window. Installed after TurboQuant so it is the

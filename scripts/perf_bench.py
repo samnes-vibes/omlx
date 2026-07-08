@@ -20,6 +20,8 @@ Scenarios (all temp=0 so runs are comparable and lossless):
     code_edit  — "rewrite this function with a small change" (echo-heavy)
     rag        — answer with quotes from provided context (echo-heavy)
     freeform   — open-ended prose (control; expects ~neutral result)
+    long_context — ≥16K-token document QA (prefill-bound; for
+                   --setting-key sparse_prefill_enabled A/B)
 
 To adapt for a new optimization branch: pass --setting-key <your_flag> to
 toggle the relevant model setting via the admin API, and optionally
@@ -69,6 +71,35 @@ _CODE = '''def process_records(records, filters, transform=None):
     return results
 '''
 
+def _long_context_doc(approx_words: int = 20000) -> str:
+    """Deterministic aperiodic long document (~16K+ tokens) for the
+    long_context scenario — the length regime sparse prefill targets."""
+    import random
+
+    rng = random.Random(7)
+    topics = [
+        "unified memory bandwidth", "scheduler admission", "KV cache spill",
+        "speculative acceptance", "quantization groups", "prefill chunking",
+        "thermal throttling", "tokenizer merges", "rotary embeddings",
+    ]
+    verbs = ["improves", "constrains", "dominates", "amortizes", "regresses"]
+    parts, words, section = [], 0, 0
+    while words < approx_words:
+        section += 1
+        sents = []
+        for _ in range(rng.randint(4, 8)):
+            t1, t2 = rng.sample(topics, 2)
+            sents.append(
+                f"Section {section}: {t1} {rng.choice(verbs)} {t2} beyond "
+                f"{rng.randint(2, 64)} concurrent requests."
+            )
+        parts.append(" ".join(sents))
+        words += len(parts[-1].split())
+    # Needle for a QA check roughly mid-document
+    parts.insert(len(parts) // 2, "NOTE: the magic checkpoint code is TANGERINE-42.")
+    return "\n\n".join(parts)
+
+
 SCENARIOS = {
     "summarize": {
         "messages": [
@@ -103,6 +134,19 @@ SCENARIOS = {
             }
         ],
         "max_tokens": 250,
+    },
+    "long_context": {
+        # ≥16K-token document QA: the prefill-bound regime that prefill-side
+        # features (sparse_prefill_enabled, specprefill_enabled) target.
+        "messages": [
+            {
+                "role": "user",
+                "content": "Context:\n" + _long_context_doc() + "\n\nWhat is "
+                "the magic checkpoint code mentioned in the NOTE? Answer with "
+                "just the code.",
+            }
+        ],
+        "max_tokens": 30,
     },
     "freeform": {
         "messages": [
