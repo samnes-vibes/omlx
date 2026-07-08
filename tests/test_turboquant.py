@@ -410,10 +410,14 @@ def test_attention_patch_preserves_sinks_with_dequant_fallback(monkeypatch):
 def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypatch):
     from mlx_lm.models import base as mlx_base
 
+    from omlx.custom_kernels import tq_attention as tq_fused
     from omlx.patches import turboquant_attention as tq_attention
 
     tq_attention.apply_turboquant_attention_patch()
     monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+    # These tests exercise prefill routing; the fused verify path (q_len 2-32)
+    # would intercept q_len=2 first, so disable it here.
+    monkeypatch.setattr(tq_fused.fast, "_ENABLED", False)
 
     fp_cache = KVCache()
     fp_cache.update_and_fetch(
@@ -465,10 +469,14 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
 def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     from mlx_lm.models import base as mlx_base
 
+    from omlx.custom_kernels import tq_attention as tq_fused
     from omlx.patches import turboquant_attention as tq_attention
 
     tq_attention.apply_turboquant_attention_patch()
     monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+    # These tests exercise prefill routing; the fused verify path (q_len 2-32)
+    # would intercept q_len=2 first, so disable it here.
+    monkeypatch.setattr(tq_fused.fast, "_ENABLED", False)
 
     fp_cache = KVCache()
     fp_cache.update_and_fetch(
