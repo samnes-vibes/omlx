@@ -146,7 +146,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
-    mtp_draft_depth: int | None = None
+    mtp_draft_depth: int | str | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -2060,6 +2060,66 @@ async def load_model(
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
 
+class MtpTuneRequest(BaseModel):
+    """Options for the MTP draft-depth tuner (all optional)."""
+
+    depths: list[int] | None = None  # default: 0..4 (0..1 without chain hook)
+    repeats: int = 2
+    max_tokens: int = 128
+
+
+@router.post("/api/models/{model_id}/mtp-tune")
+async def mtp_tune_model(
+    model_id: str,
+    request: MtpTuneRequest | None = None,
+    is_admin: bool = Depends(_require_admin_or_bearer),
+):
+    """Benchmark MTP draft depths on this machine and persist the winner.
+
+    The model must have ``mtp_enabled=true``; it is loaded on demand.
+    Afterwards ``mtp_draft_depth: "auto"`` resolves to the winning depth
+    on this machine (0 = MTP off). Trials run round-robin on the live
+    engine, so the call blocks for roughly
+    ``(len(depths) * repeats + 1) * max_tokens`` decoded tokens.
+    """
+    from .mtp_tune import run_mtp_tune
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    settings_manager = _get_settings_manager()
+    settings = settings_manager.get_settings(model_id) if settings_manager else None
+    if settings is None or not getattr(settings, "mtp_enabled", False):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "MTP tuning requires mtp_enabled=true for this model "
+                "(the tuner flips depths on the loaded MTP head)."
+            ),
+        )
+
+    request = request or MtpTuneRequest()
+    try:
+        engine = await engine_pool.get_engine(model_id, force_lm=True)
+        result = await run_mtp_tune(
+            engine,
+            model_key=Path(entry.model_path).name,
+            depths=request.depths,
+            repeats=request.repeats,
+            max_tokens=request.max_tokens,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("MTP tune failed for %s", model_id)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok", **result}
+
+
 @router.post("/api/reload")
 async def reload_models(is_admin: bool = Depends(require_admin)):
     """Reload models: re-read model settings, re-discover models, preload pinned."""
@@ -2426,13 +2486,23 @@ async def update_model_settings(
         current_settings.mtp_enabled = new_mtp_enabled
     if "mtp_draft_depth" in sent:
         value = request.mtp_draft_depth
-        if value is not None and not 1 <= int(value) <= 8:
-            raise HTTPException(
-                status_code=400,
-                detail=f"mtp_draft_depth must be between 1 and 8, got {value}",
-            )
         if value is not None:
-            current_settings.mtp_draft_depth = int(value)
+            if value == "auto":
+                current_settings.mtp_draft_depth = "auto"
+            else:
+                try:
+                    depth = int(value)
+                except (TypeError, ValueError):
+                    depth = -1
+                if not 1 <= depth <= 8:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            'mtp_draft_depth must be between 1 and 8 or "auto", '
+                            f"got {value}"
+                        ),
+                    )
+                current_settings.mtp_draft_depth = depth
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:

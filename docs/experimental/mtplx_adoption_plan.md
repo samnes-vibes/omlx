@@ -2,8 +2,8 @@
 
 Date: 2026-07-07
 Branch: `feat/mtp-multi-depth`
-Status: **Phase 1 + Phase 3 implemented** (2026-07-09) — see implementation
-notes at the end. Phase 2 not started (gated on the Phase 1 benchmark).
+Status: **Phase 1 + Phase 3 implemented; Phase 2 spike implemented**
+(2026-07-09) — see implementation notes at the end.
 Phase 1 benchmarking (step 4) **blocked on hardware**: the dev machine is an
 M1 base / 8 GB / <8 GB free disk, which can hold neither Qwen 3.6 27B nor
 Qwen 3.5 9B, and the only local MTP-family checkpoint
@@ -244,3 +244,45 @@ the plan sketch:
   preload-dispatch stamp/reset), acceptance-floor guard (disable, hint
   text, min-draft gate, healthy-rate no-op, unstamped no-op, inner
   `language_model` stamp).
+
+## Phase 2 spike implementation notes (2026-07-09)
+
+`omlx/admin/mtp_tune.py` + `POST /admin/api/models/{id}/mtp-tune` +
+`mtp_draft_depth: "auto"`. Deltas vs the plan sketch:
+
+- **No reload per depth**: trials re-stamp the live model instance's
+  per-instance markers (`_omlx_mtp_draft_depth`,
+  `_omlx_mtp_decode_enabled`) between requests instead of driving the
+  settings/reload path. The dispatch reads the stamps at chain-refill
+  time, so between-request flips are safe, each trial is cheap, and the
+  planned round-robin interleaving (thermal fairness) costs nothing.
+  Consequence: the model must be loaded with `mtp_enabled=true` to tune
+  (the head is attached at load); the endpoint 400s otherwise.
+- **Depth grid**: 0..4 by default (0 = plain autoregressive baseline);
+  models without `mtp_forward_hidden` (DeepSeek-V4, VLM runtime) sweep
+  {0, 1}. One `max_tokens=128`, temp-0 decode per trial, 2 repeats,
+  median tps, `argmax` wins; warmup run first.
+- **Persistence**: `<base_path>/mtp_tune.json` keyed by
+  `{model_dir_name: {hardware_id: {depth, tps_by_depth, tuned_at}}}`;
+  `hardware_id` = platform machine + `machdep.cpu.brand_string` slug.
+- **Resolution**: `ModelSettings.mtp_draft_depth` now accepts `"auto"`
+  (admin API too). At load, `maybe_apply_pre_load_patches` resolves it
+  from the store: untuned → depth 1 (info log points at the endpoint),
+  winner 0 → MTP decode disabled for this machine (the documented M1/M2
+  net-negative case, now automated), else the tuned depth.
+- Rather than `omlx/admin/benchmark.py` internals (full unload/load
+  orchestration + SSE events), the tuner uses `engine.stream_generate`
+  directly and trusts the engine-reported `generation_tps` — the same
+  metric benchmark.py prefers.
+- **Not done (spike cuts)**: lazy tune on first `"auto"` load (explicit
+  endpoint only — a surprise multi-minute benchmark inside a load path
+  seemed hostile), dashboard UI, staleness/invalidations of tune results
+  when checkpoints change.
+- **Tests** (`tests/test_mtp_tune.py`): store round-trip incl. depth 0 and
+  corrupt file, argmax + stamp restore on a fake engine, depth-0 winner,
+  hook-less depth clamp, mtp-disabled rejection, `"auto"` validation, and
+  end-to-end load-time resolution via `OMLX_BASE_PATH` (tuned, depth-0,
+  untuned).
+
+Real-model validation of the tuner (and the Phase 1 depth benchmark it
+automates) still needs the usual rig — same hardware blocker as step 4.

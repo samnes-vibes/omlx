@@ -289,6 +289,38 @@ def maybe_apply_pre_load_patches(
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
+        # Resolve mtp_draft_depth. "auto" reads the per-(model, machine)
+        # result persisted by the tuner (admin mtp-tune endpoint); a tuned
+        # winner of 0 means MTP is a net loss on this machine — resolve to
+        # MTP off entirely. Untuned "auto" falls back to depth 1.
+        depth_setting = (
+            getattr(model_settings, "mtp_draft_depth", 1) if model_settings else 1
+        )
+        resolved_depth = 1
+        if mtp_enabled:
+            if depth_setting == "auto":
+                from ..admin.mtp_tune import load_tuned_depth
+
+                model_key = Path(model_name).name
+                tuned = load_tuned_depth(model_key)
+                if tuned is None:
+                    logger.info(
+                        "mtp_draft_depth=auto but no tune result for %s on this "
+                        "machine; using depth 1. Run POST "
+                        "/admin/api/models/{id}/mtp-tune to tune.",
+                        model_key,
+                    )
+                elif tuned == 0:
+                    logger.info(
+                        "mtp_draft_depth=auto: tuned winner for %s on this "
+                        "machine is MTP-off (depth 0); disabling MTP decode.",
+                        model_key,
+                    )
+                    mtp_enabled = False
+                else:
+                    resolved_depth = max(1, min(8, tuned))
+            else:
+                resolved_depth = int(depth_setting or 1)
         from ..patches.mlx_lm_mtp import (
             apply_mlx_lm_mtp_patch,
             set_mtp_active,
@@ -299,9 +331,7 @@ def maybe_apply_pre_load_patches(
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
             if mtp_enabled:
-                set_mtp_draft_depth(
-                    int(getattr(model_settings, "mtp_draft_depth", 1) or 1)
-                )
+                set_mtp_draft_depth(resolved_depth)
                 head_quantized = _mtp_weights_quantized(model_name)
                 set_mtp_head_quantized(head_quantized)
                 if head_quantized:
