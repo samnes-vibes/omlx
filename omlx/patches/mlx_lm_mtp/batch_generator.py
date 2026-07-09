@@ -478,6 +478,65 @@ class _MtpStats:
     cache_ops_ms: float = 0.0  # cumulative time in trim / rollback restore
 
 
+# Runtime acceptance-floor guard (MTPLX BF16-head finding): if measured
+# acceptance stays below _MTP_ACCEPT_FLOOR after at least
+# _MTP_ACCEPT_FLOOR_MIN_DRAFTS drafted positions, MTP is a net loss (every
+# cycle pays a (depth+1)-token verify forward for ~nothing) — auto-disable
+# it on the model instance so decode falls back to standard autoregressive.
+# The classic trigger is a quantized MTP head (acceptance 5-11% vs 79-85%
+# BF16). Module-level so tests can tighten them.
+_MTP_ACCEPT_FLOOR = 0.15
+_MTP_ACCEPT_FLOOR_MIN_DRAFTS = 64
+
+
+def _maybe_disable_low_acceptance_mtp(model: Any, stats: "_MtpStats") -> bool:
+    """Auto-disable MTP on *model* when measured acceptance collapses.
+
+    Flips ``_omlx_mtp_decode_enabled`` off on the model instance (the same
+    per-load stamp ``_model_mtp_decode_enabled`` reads), so the next cycle
+    finds the batch ineligible, drops MTP state, and decode continues on
+    the standard path. Sticky until the model is reloaded.
+    """
+    if stats.draft_tokens < _MTP_ACCEPT_FLOOR_MIN_DRAFTS:
+        return False
+    rate = stats.accepted_drafts / stats.draft_tokens
+    if rate >= _MTP_ACCEPT_FLOOR:
+        return False
+    quantized = False
+    stamped = False
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        quantized = quantized or bool(
+            getattr(candidate, "_omlx_mtp_head_quantized", False)
+        )
+        if getattr(candidate, "_omlx_mtp_decode_enabled", None):
+            candidate._omlx_mtp_decode_enabled = False
+            stamped = True
+    if not stamped:
+        return False
+    cause = (
+        " The MTP head weights are quantized, which is the known cause of "
+        "acceptance collapse (5-11% int4 vs 79-85% BF16); use a checkpoint "
+        "with BF16 mtp.* weights to keep MTP productive."
+        if quantized
+        else ""
+    )
+    logger.warning(
+        "MTP acceptance %.1f%% over %d drafted positions is below the %.0f%% "
+        "floor; disabling MTP for this model and falling back to standard "
+        "decode.%s",
+        rate * 100,
+        stats.draft_tokens,
+        _MTP_ACCEPT_FLOOR * 100,
+        cause,
+    )
+    return True
+
+
 @dataclass
 class _MtpState:
     """Per-batch MTP state stashed on the GenerationBatch instance."""
@@ -1578,6 +1637,10 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     state.stats.cycles += 1
     state.stats.draft_tokens += depth
     state.stats.accepted_drafts += accepted
+    # Acceptance-floor guard: the disable takes effect on the *next* cycle
+    # (this one finishes normally; output correctness never depended on
+    # acceptance, only throughput does).
+    _maybe_disable_low_acceptance_mtp(gen_batch.model, state.stats)
 
     if accepted == depth:
         state.stats.accepts += 1

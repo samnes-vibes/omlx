@@ -146,6 +146,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
+    mtp_draft_depth: int | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -2423,6 +2424,15 @@ async def update_model_settings(
                     detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+    if "mtp_draft_depth" in sent:
+        value = request.mtp_draft_depth
+        if value is not None and not 1 <= int(value) <= 8:
+            raise HTTPException(
+                status_code=400,
+                detail=f"mtp_draft_depth must be between 1 and 8, got {value}",
+            )
+        if value is not None:
+            current_settings.mtp_draft_depth = int(value)
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:

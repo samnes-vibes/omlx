@@ -75,6 +75,25 @@ def mtp_draft_depth() -> int:
     return _MTP_DRAFT_DEPTH
 
 
+# Construction-time marker: True when the checkpoint's mtp.* weights are
+# quantized. Quantized MTP heads are known to collapse acceptance (79-85%
+# BF16 → 5-11% int4, per the MTPLX finding); the marker is stamped onto
+# loaded model instances (``_omlx_mtp_head_quantized``) so the runtime
+# acceptance-floor guard in batch_generator can cite the likely cause when
+# it auto-disables MTP.
+_MTP_HEAD_QUANTIZED = False
+
+
+def set_mtp_head_quantized(quantized: bool) -> None:
+    """Record whether the next load's MTP head weights are quantized."""
+    global _MTP_HEAD_QUANTIZED
+    _MTP_HEAD_QUANTIZED = bool(quantized)
+
+
+def mtp_head_quantized() -> bool:
+    return _MTP_HEAD_QUANTIZED
+
+
 def apply_mlx_lm_mtp_patch() -> bool:
     """Apply the model-side and BatchGenerator monkey-patches.
 

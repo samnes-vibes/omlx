@@ -266,10 +266,13 @@ def _patch_model(dsv4: Any) -> None:
         n_mtp = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
         # See qwen35_model._patch_model: gated on the MTP active-flag so
         # mtp_enabled=False produces a model indistinguishable from stock.
-        from . import is_mtp_active
+        from . import is_mtp_active, mtp_head_quantized
 
         mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
+        self._omlx_mtp_head_quantized = (
+            mtp_head_quantized() if mtp_decode_enabled else False
+        )
         # Multi-depth drafting (mtp_draft_depth > 1) is not supported on
         # DeepSeek-V4 in this version: the head cache is a RotatingKVCache
         # whose speculative chain entries cannot be safely trimmed once

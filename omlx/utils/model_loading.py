@@ -194,10 +194,15 @@ def maybe_apply_pre_load_patches(
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.
-    from ..patches.mlx_lm_mtp import set_mtp_active, set_mtp_draft_depth
+    from ..patches.mlx_lm_mtp import (
+        set_mtp_active,
+        set_mtp_draft_depth,
+        set_mtp_head_quantized,
+    )
 
     set_mtp_active(False)
     set_mtp_draft_depth(1)
+    set_mtp_head_quantized(False)
 
     _patch_mlx_lm_load_config()
 
@@ -288,6 +293,7 @@ def maybe_apply_pre_load_patches(
             apply_mlx_lm_mtp_patch,
             set_mtp_active,
             set_mtp_draft_depth,
+            set_mtp_head_quantized,
         )
 
         if apply_mlx_lm_mtp_patch():
@@ -296,6 +302,17 @@ def maybe_apply_pre_load_patches(
                 set_mtp_draft_depth(
                     int(getattr(model_settings, "mtp_draft_depth", 1) or 1)
                 )
+                head_quantized = _mtp_weights_quantized(model_name)
+                set_mtp_head_quantized(head_quantized)
+                if head_quantized:
+                    logger.warning(
+                        "MTP head weights in %s are quantized. Quantized MTP "
+                        "heads are known to collapse speculative acceptance "
+                        "(79-85%% BF16 vs 5-11%% int4); if measured acceptance "
+                        "stays below the floor, MTP will auto-disable for this "
+                        "model and decode falls back to standard autoregressive.",
+                        model_name,
+                    )
             if mtp_enabled:
                 logger.info(
                     "Native MTP patch applied for %s (model_type=%s, active)",
@@ -513,6 +530,46 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
                         return True
         except Exception as e:
             logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)
+    return False
+
+
+def _mtp_weights_quantized(model_path: str | Path) -> bool:
+    """True iff the checkpoint's ``mtp.*`` weights are quantized.
+
+    MLX quantized layers persist ``.scales`` / ``.biases`` companion tensors
+    next to each quantized ``.weight``, so the presence of an
+    ``mtp.*…scales`` key in the weight index is a reliable, cheap signal
+    (no shard I/O). Quantized MTP heads are known to collapse speculative
+    acceptance (79-85% BF16 → 5-11% int4); callers warn at load and arm the
+    runtime acceptance-floor guard.
+    """
+    p = Path(model_path)
+    if not p.is_dir():
+        return False
+
+    def _is_quant_mtp_key(k: str) -> bool:
+        return k.startswith(_MTP_WEIGHT_PREFIXES) and k.endswith(".scales")
+
+    index_path = p / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            data = json.loads(index_path.read_text())
+            weight_map = data.get("weight_map") or {}
+            return any(_is_quant_mtp_key(k) for k in weight_map)
+        except Exception as e:
+            logger.debug("Failed to read %s for mtp quant scan: %s", index_path, e)
+
+    try:
+        import safetensors
+    except Exception:
+        return False
+    for shard in sorted(p.glob("*.safetensors")):
+        try:
+            with safetensors.safe_open(str(shard), framework="numpy") as f:
+                if any(_is_quant_mtp_key(k) for k in f.keys()):
+                    return True
+        except Exception as e:
+            logger.debug("Failed to read %s header for mtp quant scan: %s", shard, e)
     return False
 
 

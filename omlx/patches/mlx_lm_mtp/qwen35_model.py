@@ -495,13 +495,18 @@ def _patch_text_model(q35: Any) -> None:
         # build: ``hasattr(self, "mtp")`` is False, sanitize strips
         # ``mtp.*`` weights, and BatchGenerator's _is_mtp_eligible bails
         # out because the inner ``language_model`` has no ``mtp``.
-        from . import is_mtp_active, mtp_draft_depth
+        from . import is_mtp_active, mtp_draft_depth, mtp_head_quantized
 
         mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
         # Per-instance draft depth, stamped at construction like the decode
         # flag so later loads with different settings can't change it.
         self._omlx_mtp_draft_depth = mtp_draft_depth() if mtp_decode_enabled else 1
+        # Quantized-head marker: read by the acceptance-floor guard so the
+        # auto-disable warning can name the likely cause.
+        self._omlx_mtp_head_quantized = (
+            mtp_head_quantized() if mtp_decode_enabled else False
+        )
         if mtp_decode_enabled:
             self.mtp = q35.MTPModule(args)
 

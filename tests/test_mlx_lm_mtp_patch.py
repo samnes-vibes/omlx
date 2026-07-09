@@ -18,6 +18,7 @@ from omlx.model_settings import ModelSettings
 from omlx.utils.model_loading import (
     _has_mtp_heads,
     _is_mtp_compatible,
+    _mtp_weights_quantized,
     maybe_apply_pre_load_patches,
 )
 
@@ -2122,3 +2123,134 @@ class TestMultiDepthGreedyIdentity:
         assert state.stats.accepts > 0, "full-accept (bonus) path never ran"
         assert state.stats.rejects > 0, "reject path never ran"
         assert 0 < state.stats.accepted_drafts < state.stats.draft_tokens
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: quantized-head detection + acceptance-floor auto-disable
+# ---------------------------------------------------------------------------
+
+
+class TestMtpWeightsQuantized:
+    def _write_index(self, tmp_path, keys):
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {k: "model.safetensors" for k in keys}})
+        )
+
+    def test_quantized_mtp_head_detected(self, tmp_path):
+        self._write_index(
+            tmp_path,
+            [
+                "model.layers.0.self_attn.q_proj.weight",
+                "mtp.fc.weight",
+                "mtp.fc.scales",
+                "mtp.fc.biases",
+            ],
+        )
+        assert _mtp_weights_quantized(tmp_path) is True
+
+    def test_bf16_mtp_head_not_flagged(self, tmp_path):
+        self._write_index(
+            tmp_path,
+            [
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.q_proj.scales",
+                "mtp.fc.weight",
+            ],
+        )
+        assert _mtp_weights_quantized(tmp_path) is False
+
+    def test_nested_prefix_detected(self, tmp_path):
+        self._write_index(tmp_path, ["language_model.mtp.fc.scales"])
+        assert _mtp_weights_quantized(tmp_path) is True
+
+    def test_missing_dir_is_false(self, tmp_path):
+        assert _mtp_weights_quantized(tmp_path / "nope") is False
+
+    def test_preload_dispatch_stamps_quantized_flag(self, tmp_path):
+        from omlx.patches.mlx_lm_mtp import mtp_head_quantized
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5", "mtp_num_hidden_layers": 1})
+        )
+        self._write_index(tmp_path, ["mtp.fc.weight", "mtp.fc.scales"])
+        maybe_apply_pre_load_patches(
+            str(tmp_path), model_settings=ModelSettings(mtp_enabled=True)
+        )
+        assert mtp_head_quantized() is True
+        # A subsequent non-MTP load must reset the flag.
+        maybe_apply_pre_load_patches(
+            str(tmp_path), model_settings=ModelSettings(mtp_enabled=False)
+        )
+        assert mtp_head_quantized() is False
+
+
+class TestAcceptanceFloorGuard:
+    def _stats(self, drafted, accepted):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _MtpStats
+
+        return _MtpStats(
+            cycles=drafted, draft_tokens=drafted, accepted_drafts=accepted
+        )
+
+    def test_disables_on_collapsed_acceptance(self, caplog):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+        )
+
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True, _omlx_mtp_head_quantized=False
+        )
+        with caplog.at_level("WARNING"):
+            assert _maybe_disable_low_acceptance_mtp(model, self._stats(100, 5))
+        assert model._omlx_mtp_decode_enabled is False
+        assert any("disabling MTP" in r.getMessage() for r in caplog.records)
+
+    def test_quantized_hint_in_warning(self, caplog):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+        )
+
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True, _omlx_mtp_head_quantized=True
+        )
+        with caplog.at_level("WARNING"):
+            assert _maybe_disable_low_acceptance_mtp(model, self._stats(100, 5))
+        assert any("quantized" in r.getMessage() for r in caplog.records)
+
+    def test_no_disable_below_min_drafts(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+        )
+
+        model = SimpleNamespace(_omlx_mtp_decode_enabled=True)
+        assert not _maybe_disable_low_acceptance_mtp(model, self._stats(10, 0))
+        assert model._omlx_mtp_decode_enabled is True
+
+    def test_no_disable_on_healthy_acceptance(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+        )
+
+        model = SimpleNamespace(_omlx_mtp_decode_enabled=True)
+        assert not _maybe_disable_low_acceptance_mtp(model, self._stats(100, 80))
+        assert model._omlx_mtp_decode_enabled is True
+
+    def test_unstamped_model_is_noop(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+        )
+
+        model = SimpleNamespace()
+        assert not _maybe_disable_low_acceptance_mtp(model, self._stats(100, 0))
+
+    def test_inner_language_model_stamp_flipped(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+        )
+
+        inner = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True, _omlx_mtp_head_quantized=False
+        )
+        model = SimpleNamespace(language_model=inner)
+        assert _maybe_disable_low_acceptance_mtp(model, self._stats(100, 0))
+        assert inner._omlx_mtp_decode_enabled is False

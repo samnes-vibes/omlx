@@ -2,8 +2,13 @@
 
 Date: 2026-07-07
 Branch: `feat/mtp-multi-depth`
-Status: **Phase 1 implemented** (2026-07-09) — see "Phase 1 implementation notes"
-at the end. Phases 2–3 not started; Phase 1 benchmarking (step 4) pending.
+Status: **Phase 1 + Phase 3 implemented** (2026-07-09) — see implementation
+notes at the end. Phase 2 not started (gated on the Phase 1 benchmark).
+Phase 1 benchmarking (step 4) **blocked on hardware**: the dev machine is an
+M1 base / 8 GB / <8 GB free disk, which can hold neither Qwen 3.6 27B nor
+Qwen 3.5 9B, and the only local MTP-family checkpoint
+(mlx-community Qwen3.5-0.8B-4bit) ships no mtp.* weights. Run step 4 on the
+usual rig with `scripts/perf_bench.py --sweep-values` (added for this).
 Upstream reference: [youssofal/MTPLX](https://github.com/youssofal/MTPLX) (Apache-2.0)
 Companion to: [5x_speedup_research.md](5x_speedup_research.md), [ngram_speculation_plan.md](ngram_speculation_plan.md)
 Measured outcomes ledger: [speedup_results_tracker.md](speedup_results_tracker.md)
@@ -204,6 +209,38 @@ Landed on `feat/mtp-multi-depth`. Deltas vs the plan sketch above:
   (`drafts a/b`), the per-cycle accept counters kept for full-accepts.
 
 Next: plan step 4 — measure depth 1/2/3/4 on real checkpoints via
-`scripts/perf_bench.py --ab --setting-key mtp_draft_depth`, record in
-[speedup_results_tracker.md](speedup_results_tracker.md); go/no-go for
-Phase 2 auto-tune.
+`scripts/perf_bench.py --setting-key mtp_draft_depth --sweep-values 1,2,3,4`,
+record in [speedup_results_tracker.md](speedup_results_tracker.md); go/no-go
+for Phase 2 auto-tune. Blocked on hardware as of 2026-07-09 (see Status).
+
+## Phase 3 implementation notes (2026-07-09)
+
+Landed on `feat/mtp-multi-depth` alongside benchmark plumbing. Deltas vs
+the plan sketch:
+
+- **3.1 (inspect/classification)** turned out to already exist:
+  `_mtp_compat_for_model` in `omlx/admin/routes.py` performs the full
+  config + model_type + mtp.*-weights classification and the admin models
+  listing exposes `mtp_compatible` / `mtp_compatibility_reason`. Load-time
+  logging also existed. No new code needed beyond the guard below.
+- **3.2 (BF16 head guard)**: `_mtp_weights_quantized` in
+  `omlx/utils/model_loading.py` detects quantized MTP heads from the
+  safetensors index (an `mtp.*…​.scales` key; no shard I/O), warns at load,
+  and stamps `_omlx_mtp_head_quantized` on the model instance (via a
+  process-wide construction flag mirroring `set_mtp_draft_depth`).
+  At runtime `_maybe_disable_low_acceptance_mtp` (`batch_generator.py`)
+  checks after every verify cycle: acceptance < 15% after ≥ 64 drafted
+  positions flips `_omlx_mtp_decode_enabled` off on the model instance —
+  the next cycle finds the batch ineligible, drops MTP state, and decode
+  continues on the standard path (sticky until reload). The warning names
+  the quantized head as the likely cause when the stamp is set.
+- **Benchmark plumbing for step 4**: `mtp_draft_depth` was missing from
+  the admin API's settings request model (settable only via
+  model_settings.json on disk) — added with 1–8 validation.
+  `scripts/perf_bench.py` gained `--sweep-values` (comma-separated JSON
+  values for `--setting-key`, one pass per value, comparison table vs the
+  first value).
+- **Tests**: quantized-index detection (incl. nested prefixes and the
+  preload-dispatch stamp/reset), acceptance-floor guard (disable, hint
+  text, min-draft gate, healthy-rate no-op, unstamped no-op, inner
+  `language_model` stamp).

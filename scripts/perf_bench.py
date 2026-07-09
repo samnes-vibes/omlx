@@ -247,15 +247,20 @@ def fetch_admin_stats(base_url, stats_path, token=None, reset=False):
         return {}
 
 
-def set_setting_enabled(base_url, model, setting_key, enabled, token=None):
-    """Flip a boolean model setting via the admin API (auto-reloads loaded models)."""
+def set_setting_value(base_url, model, setting_key, value, token=None):
+    """Set a model setting via the admin API (auto-reloads loaded models)."""
     with _request(
         f"{base_url}/admin/api/models/{model}/settings",
-        payload={setting_key: bool(enabled)},
+        payload={setting_key: value},
         method="PUT",
         token=token,
     ) as resp:
         return json.loads(resp.read())
+
+
+def set_setting_enabled(base_url, model, setting_key, enabled, token=None):
+    """Flip a boolean model setting via the admin API (auto-reloads loaded models)."""
+    return set_setting_value(base_url, model, setting_key, bool(enabled), token=token)
 
 
 def summarize_stats(stats):
@@ -317,6 +322,14 @@ def main():
         help="model settings key to toggle for --ab (e.g. ngram_spec_enabled)",
     )
     ap.add_argument(
+        "--sweep-values",
+        default=None,
+        help=(
+            "comma-separated JSON values to sweep --setting-key over "
+            "(e.g. 1,2,3,4); one pass per value, compared against the first"
+        ),
+    )
+    ap.add_argument(
         "--stats-path",
         default=None,
         help="admin API path for feature stats, e.g. admin/api/ngram-spec/stats",
@@ -324,8 +337,8 @@ def main():
     ap.add_argument("--json", action="store_true", help="emit raw JSON results")
     args = ap.parse_args()
 
-    if args.ab and not args.setting_key:
-        print("error: --ab requires --setting-key", file=sys.stderr)
+    if (args.ab or args.sweep_values) and not args.setting_key:
+        print("error: --ab/--sweep-values requires --setting-key", file=sys.stderr)
         return 1
 
     scenarios = args.scenario or sorted(SCENARIOS)
@@ -340,7 +353,30 @@ def main():
         print(f"error: server not reachable at {args.base_url}: {e}", file=sys.stderr)
         return 1
 
-    if args.ab:
+    if args.sweep_values:
+        values = [json.loads(v) for v in args.sweep_values.split(",")]
+        passes = {}
+        for value in values:
+            print(f"== pass: {args.setting_key} = {value!r} ==")
+            set_setting_value(args.base_url, args.model, args.setting_key, value,
+                              token=token)
+            time.sleep(2)
+            passes[str(value)] = run_pass(args.base_url, args.model, scenarios,
+                                          args.runs, args.warmup, args.stats_path,
+                                          token)
+            print()
+        base_key = str(values[0])
+        print(f"{'scenario':<12} " + " ".join(
+            f"{f'{v} tok/s':>12}" for v in passes) + f" {'best':>8}")
+        for name in scenarios:
+            rates = {v: passes[v][name]["decode_tok_s"] for v in passes}
+            best = max(rates, key=rates.get)
+            cells = " ".join(f"{rates[v]:>12.1f}" for v in passes)
+            rel = rates[best] / rates[base_key]
+            print(f"{name:<12} {cells} {best:>4} {rel:.2f}x")
+        if args.json:
+            print(json.dumps(passes, indent=2))
+    elif args.ab:
         print(f"== pass 1: {args.setting_key} OFF ==")
         set_setting_enabled(args.base_url, args.model, args.setting_key, False, token=token)
         time.sleep(2)
