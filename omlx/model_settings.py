@@ -90,6 +90,10 @@ class ModelSettings:
             continuous batches fall back to standard decoding automatically. Compatible
             model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
             dflash_enabled and turboquant_kv_enabled.
+        mtp_draft_depth: Number of chained MTP-head drafts per verify cycle (1-8,
+            default 1 = original single-draft behavior). Higher depths verify
+            depth+1 positions per backbone forward; net effect depends on accept
+            rate and on whether decode is bandwidth-bound on this machine.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model.
@@ -195,6 +199,14 @@ class ModelSettings:
     # with dflash and turboquant.
     mtp_enabled: bool = False
 
+    # Draft depth for native MTP: the MTP head is applied autoregressively
+    # this many times per verify cycle, so one backbone forward verifies
+    # depth+1 positions (expected tokens/cycle: 1 + p + p^2 + ... + p^depth).
+    # 1 = the original single-draft cycle (default; bit-identical behavior).
+    # Only 1 is supported on DeepSeek-V4 in this version; deeper values are
+    # clamped to 1 at decode time for models without chained-draft support.
+    mtp_draft_depth: int = 1
+
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
@@ -236,6 +248,10 @@ class ModelSettings:
             raise ValueError(
                 "mtp_enabled and turboquant_kv_enabled cannot both be True; "
                 "TurboQuant patches the attention path that MTP relies on"
+            )
+        if not 1 <= int(self.mtp_draft_depth) <= 8:
+            raise ValueError(
+                f"mtp_draft_depth must be between 1 and 8, got {self.mtp_draft_depth}"
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path

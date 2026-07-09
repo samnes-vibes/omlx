@@ -1844,3 +1844,281 @@ class TestRotatingCacheMtpUndo:
         assert cache.is_trimmable()
         assert cache.trim(1) == 1
         assert cache.offset == 3
+
+
+# ---------------------------------------------------------------------------
+# Multi-depth drafting (mtp_draft_depth > 1)
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreOrTrimMultiDepth:
+    def test_partial_accept_trims_rejected_suffix(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _restore_or_trim_caches
+
+        caches = [_FakeTrimmable(), _FakeTrimmable()]
+        # 3 drafts written, 1 accepted -> trim 2.
+        assert _restore_or_trim_caches(caches, accepted=1, total_drafts=3) is True
+        assert all(c.trimmed == 2 for c in caches)
+
+    def test_snapshot_list_restores_accepted_index(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _restore_or_trim_caches
+
+        class _FakeSSM:
+            def __init__(self, snaps):
+                self.rollback_state = snaps
+                self.slots = {}
+
+            def __setitem__(self, idx, value):
+                self.slots[idx] = value
+
+        snaps = [("conv0", "ssm0"), ("conv1", "ssm1"), ("conv2", "ssm2")]
+        ssm = _FakeSSM(list(snaps))
+        kv = _FakeTrimmable()
+        assert _restore_or_trim_caches([ssm, kv], accepted=1, total_drafts=3) is True
+        # accepted=1 -> restore the state after confirmed + 1 draft.
+        assert ssm.slots == {0: "conv1", 1: "ssm1"}
+        assert ssm.rollback_state is None
+        assert kv.trimmed == 2
+
+    def test_snapshot_index_out_of_range_refuses(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _restore_or_trim_caches
+
+        class _FakeSSM:
+            def __init__(self):
+                self.rollback_state = [("c0", "s0")]
+
+            def __setitem__(self, idx, value):
+                raise AssertionError("must not mutate on refusal")
+
+        kv = _FakeTrimmable()
+        assert (
+            _restore_or_trim_caches([_FakeSSM(), kv], accepted=1, total_drafts=2)
+            is False
+        )
+        assert kv.trimmed == 0
+
+    def test_legacy_tuple_snapshot_still_supported(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _restore_or_trim_caches
+
+        class _FakeSSM:
+            def __init__(self):
+                self.rollback_state = ("c0", "s0")
+                self.slots = {}
+
+            def __setitem__(self, idx, value):
+                self.slots[idx] = value
+
+        ssm = _FakeSSM()
+        assert _restore_or_trim_caches([ssm], accepted=0, total_drafts=1) is True
+        assert ssm.slots == {0: "c0", 1: "s0"}
+
+
+class TestDraftDepthSetting:
+    def test_default_depth_is_one(self):
+        assert ModelSettings().mtp_draft_depth == 1
+
+    @pytest.mark.parametrize("depth", [0, 9, -1])
+    def test_out_of_range_depth_rejected(self, depth):
+        with pytest.raises(ValueError):
+            ModelSettings(mtp_draft_depth=depth)
+
+    @pytest.mark.parametrize("depth", [1, 4, 8])
+    def test_valid_depths_accepted(self, depth):
+        assert ModelSettings(mtp_draft_depth=depth).mtp_draft_depth == depth
+
+    def test_depth_resolution_clamps_without_chain_hook(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _mtp_draft_depth
+
+        class _NoChain:
+            _omlx_mtp_draft_depth = 3
+
+        class _WithChain:
+            _omlx_mtp_draft_depth = 3
+
+            def mtp_forward_hidden(self, *a):
+                pass
+
+        assert _mtp_draft_depth(_NoChain()) == 1
+        assert _mtp_draft_depth(_WithChain()) == 3
+        assert _mtp_draft_depth(SimpleNamespace()) == 1
+
+
+class TestMultiDepthGreedyIdentity:
+    """End-to-end greedy identity: the MTP draft/verify cycle at any depth
+    must emit exactly the same token stream as plain autoregressive greedy
+    decoding of the same model. Runs a real (tiny, random-weight) patched
+    Qwen3.5 TextModel so the per-position GatedDeltaNet snapshots, the
+    partial rollback, and the chained head cache are all exercised. The
+    small vocab makes chance accepts/partial-accepts frequent, so both the
+    accept and reject paths run."""
+
+    PROMPT = [1, 2, 3, 4, 5, 6, 7]
+    N_TOKENS = 60
+
+    @pytest.fixture()
+    def model(self):
+        try:
+            import mlx.core as mx
+            from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+        except ImportError:
+            pytest.skip("mlx-lm not importable")
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+            set_mtp_draft_depth,
+        )
+
+        assert apply_mlx_lm_mtp_patch() is True
+        args = TextModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 8,
+                "linear_num_value_heads": 2,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 3,
+                "full_attention_interval": 2,
+                "tie_word_embeddings": True,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 16,
+                "rope_theta": 1000.0,
+                "partial_rotary_factor": 0.5,
+                "max_position_embeddings": 512,
+                "mtp_num_hidden_layers": 1,
+            }
+        )
+        mx.random.seed(17)
+        set_mtp_active(True)
+        set_mtp_draft_depth(1)
+        try:
+            model = TextModel(args)
+            mx.eval(model.parameters())
+        finally:
+            set_mtp_active(False)
+        assert getattr(model, "_omlx_mtp_decode_enabled", False)
+        assert getattr(model, "mtp", None) is not None
+        return model
+
+    @staticmethod
+    def _greedy_sampler():
+        import mlx.core as mx
+
+        def sampler(lp):
+            return mx.argmax(lp, axis=-1)
+
+        return sampler
+
+    def _reference_decode(self, model):
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+
+        cache = make_prompt_cache(model)
+        tokens = list(self.PROMPT)
+        out = []
+        inputs = mx.array([tokens], dtype=mx.uint32)
+        for _ in range(self.N_TOKENS):
+            logits = model(inputs, cache=cache)
+            nxt = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+            out.append(nxt)
+            inputs = mx.array([[nxt]], dtype=mx.uint32)
+        return out
+
+    def _mtp_decode(self, model, depth):
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        model._omlx_mtp_draft_depth = depth
+        cache = make_prompt_cache(model)
+        prompt = mx.array([self.PROMPT], dtype=mx.uint32)
+        logits = model(prompt, cache=cache)
+        lp = logits[:, -1, :] - mx.logsumexp(logits[:, -1, :], axis=-1, keepdims=True)
+        first_tok = mx.argmax(lp, axis=-1)
+
+        gen_batch = SimpleNamespace(
+            model=model,
+            uids=[1],
+            prompt_cache=cache,
+            tokens=[list(self.PROMPT)],
+            samplers=[None],
+            fallback_sampler=self._greedy_sampler(),
+            logits_processors=[[]],
+            _next_tokens=first_tok,
+            _next_logprobs=[lp.squeeze(0)],
+            _token_context=[None],
+        )
+        bg._post_init_mtp(gen_batch)
+        state = gen_batch._omlx_mtp_state
+        assert state is not None
+        assert state.depth == depth
+        assert len(state.draft_ids) == depth
+
+        emitted = []
+        while len(emitted) < self.N_TOKENS:
+            while state.queue and len(emitted) < self.N_TOKENS:
+                token_id, _lp, _src = state.queue.popleft()
+                emitted.append(token_id)
+            if len(emitted) < self.N_TOKENS:
+                bg._run_verify_cycle(gen_batch, state)
+                assert state.queue, "verify cycle must queue at least one token"
+        return emitted, state
+
+    @pytest.mark.parametrize("depth", [1, 2, 3, 4])
+    def test_greedy_identity_at_depth(self, model, depth):
+        reference = self._reference_decode(model)
+        emitted, state = self._mtp_decode(model, depth)
+        assert emitted == reference
+        assert state.stats.cycles > 0
+        assert state.stats.draft_tokens == state.stats.cycles * depth
+
+    def test_deeper_chain_exercises_partial_accepts(self, model):
+        """Coverage guard for the identity tests above: force a mix of
+        accepted / rejected draft positions so the partial rollback, the
+        full-accept bonus path, and the stale head-cache trims all run.
+
+        A random-weight head essentially never matches the target argmax
+        (both are deterministic but uncorrelated functions), so drafts are
+        rigged with an oracle head: it returns the target's degenerate
+        argmax token on most calls and a wrong token periodically, giving
+        deterministic partial-accept patterns at depth 3. Greedy identity
+        must still hold — rigged drafts only change *which* cycle path
+        emits each token, never the emitted values."""
+        import mlx.core as mx
+
+        reference = self._reference_decode(model)
+        target_tok = reference[0]
+        assert all(t == target_tok for t in reference), (
+            "test premise: tiny random model degenerates to a constant "
+            "greedy stream"
+        )
+        wrong_tok = (target_tok + 1) % 8
+
+        calls = {"n": 0}
+        vocab = 8
+
+        def oracle_head(hidden, next_ids, mtp_cache):
+            calls["n"] += 1
+            # Period 4 vs the 3 head calls per depth-3 cycle: the wrong
+            # draft lands at a different chain position each cycle and some
+            # cycles have none at all, covering full accepts too.
+            tok = wrong_tok if calls["n"] % 4 == 0 else target_tok
+            logits = mx.full((1, 1, vocab), -10.0)
+            logits[0, 0, tok] = 10.0
+            return logits, hidden
+
+        model.mtp_forward_hidden = oracle_head
+        try:
+            emitted, state = self._mtp_decode(model, 3)
+        finally:
+            del model.mtp_forward_hidden
+
+        assert emitted == reference
+        assert state.stats.accepts > 0, "full-accept (bonus) path never ran"
+        assert state.stats.rejects > 0, "reject path never ran"
+        assert 0 < state.stats.accepted_drafts < state.stats.draft_tokens

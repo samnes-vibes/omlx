@@ -65,8 +65,11 @@ def _wrap_rotating(cls, fields) -> None:
     def update_and_fetch(self, keys, values):
         # Only armed verify-sized updates are undoable: S == 1 uses the
         # in-place ring write (setitem invalidates reference snapshots) and
-        # prompt chunks have no rollback consumer.
-        if keys.shape[2] == 2 and _is_undo_armed():
+        # prompt chunks have no rollback consumer. S >= 2 covers the MTP
+        # verify forward at any draft depth ([next_main, d_1 .. d_k]); the
+        # armed flag is only set around that forward, so ordinary multi-token
+        # updates are never stashed.
+        if keys.shape[2] >= 2 and _is_undo_armed():
             snap = {}
             for f in fields:
                 v = getattr(self, f)

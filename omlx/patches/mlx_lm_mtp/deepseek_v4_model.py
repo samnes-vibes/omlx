@@ -270,6 +270,11 @@ def _patch_model(dsv4: Any) -> None:
 
         mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
+        # Multi-depth drafting (mtp_draft_depth > 1) is not supported on
+        # DeepSeek-V4 in this version: the head cache is a RotatingKVCache
+        # whose speculative chain entries cannot be safely trimmed once
+        # rotated, and mtp_forward has no chained-hidden variant. Clamp to 1.
+        self._omlx_mtp_draft_depth = 1
         if mtp_decode_enabled:
             n_main = config.num_hidden_layers
             self.mtp = [dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)]

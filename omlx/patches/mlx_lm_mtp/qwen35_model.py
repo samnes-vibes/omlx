@@ -200,7 +200,14 @@ def _register_mtp_classes(q35: Any) -> None:
             ]
             self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        def __call__(self, hidden_states, next_token_ids, embed_tokens, cache=None):
+        def __call__(
+            self,
+            hidden_states,
+            next_token_ids,
+            embed_tokens,
+            cache=None,
+            return_hidden: bool = False,
+        ):
             embeds = embed_tokens(next_token_ids)
             e = self.pre_fc_norm_embedding(embeds)
             h = self.pre_fc_norm_hidden(hidden_states)
@@ -213,6 +220,11 @@ def _register_mtp_classes(q35: Any) -> None:
             for layer, c in zip(self.layers, cache):
                 fused = layer(fused, mask, c)
 
+            if return_hidden:
+                # Pre-norm hidden for chained (multi-depth) drafting: the
+                # next chain step fuses this through pre_fc_norm_hidden,
+                # mirroring how the backbone's pre-norm hidden feeds step 1.
+                return self.norm(fused), fused
             return self.norm(fused)
 
     q35.MTPDecoderLayer = MTPDecoderLayer
@@ -319,7 +331,6 @@ def _patch_gated_delta_net(q35: Any) -> None:
 
         if n_confirmed > 0 and n_confirmed < S:
             mask_c = mask[:, :n_confirmed] if mask is not None else None
-            mask_d = mask[:, n_confirmed:] if mask is not None else None
             out_c, conv_c, ssm_c = self._process_chunk(
                 qkv[:, :n_confirmed],
                 a[:, :n_confirmed],
@@ -328,17 +339,33 @@ def _patch_gated_delta_net(q35: Any) -> None:
                 ssm_state,
                 mask_c,
             )
+            # Process the draft suffix one token at a time, snapshotting the
+            # (conv, ssm) state after the confirmed prefix and after each
+            # draft token except the last. rollback_state[j] is the state to
+            # restore when exactly j draft tokens are accepted, so a partial
+            # acceptance at any chain position has an exact restore point.
+            # With one draft token (depth 1) this degenerates to the original
+            # single-snapshot behavior at identical cost (the draft chunk was
+            # already a single token).
+            snapshots = [(conv_c, ssm_c)]
+            outs = [out_c]
+            conv_f, ssm_f = conv_c, ssm_c
+            for i in range(n_confirmed, S):
+                mask_i = mask[:, i : i + 1] if mask is not None else None
+                out_i, conv_f, ssm_f = self._process_chunk(
+                    qkv[:, i : i + 1],
+                    a[:, i : i + 1],
+                    b[:, i : i + 1],
+                    conv_f,
+                    ssm_f,
+                    mask_i,
+                )
+                outs.append(out_i)
+                if i < S - 1:
+                    snapshots.append((conv_f, ssm_f))
             if cache is not None:
-                cache.rollback_state = (conv_c, ssm_c)
-            out_d, conv_f, ssm_f = self._process_chunk(
-                qkv[:, n_confirmed:],
-                a[:, n_confirmed:],
-                b[:, n_confirmed:],
-                conv_c,
-                ssm_c,
-                mask_d,
-            )
-            out = mx.concatenate([out_c, out_d], axis=1)
+                cache.rollback_state = snapshots
+            out = mx.concatenate(outs, axis=1)
         else:
             lengths = cache.lengths if cache is not None else None
             out, conv_f, ssm_f = self._process_chunk(
@@ -468,10 +495,13 @@ def _patch_text_model(q35: Any) -> None:
         # build: ``hasattr(self, "mtp")`` is False, sanitize strips
         # ``mtp.*`` weights, and BatchGenerator's _is_mtp_eligible bails
         # out because the inner ``language_model`` has no ``mtp``.
-        from . import is_mtp_active
+        from . import is_mtp_active, mtp_draft_depth
 
         mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
+        # Per-instance draft depth, stamped at construction like the decode
+        # flag so later loads with different settings can't change it.
+        self._omlx_mtp_draft_depth = mtp_draft_depth() if mtp_decode_enabled else 1
         if mtp_decode_enabled:
             self.mtp = q35.MTPModule(args)
 
@@ -508,6 +538,22 @@ def _patch_text_model(q35: Any) -> None:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(mtp_out)
         return self.lm_head(mtp_out)
+
+    def mtp_forward_hidden(self, hidden_states, next_token_ids, mtp_cache):
+        """Like ``mtp_forward`` but also returns the head's pre-norm hidden,
+        which multi-depth drafting feeds back as the next chain step's
+        ``hidden_states``. Presence of this method is what marks a model as
+        supporting ``mtp_draft_depth > 1``."""
+        mtp_out, mtp_hidden = self.mtp(
+            hidden_states,
+            next_token_ids,
+            self.model.embed_tokens,
+            mtp_cache,
+            return_hidden=True,
+        )
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(mtp_out), mtp_hidden
+        return self.lm_head(mtp_out), mtp_hidden
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -635,6 +681,7 @@ def _patch_text_model(q35: Any) -> None:
     __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
+    cls.mtp_forward_hidden = mtp_forward_hidden
     cls.make_mtp_cache = make_mtp_cache
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
@@ -672,12 +719,18 @@ def _patch_outer_model(q35: Any) -> None:
             hidden_states, next_token_ids, mtp_cache
         )
 
+    def mtp_forward_hidden(self, hidden_states, next_token_ids, mtp_cache):
+        return self.language_model.mtp_forward_hidden(
+            hidden_states, next_token_ids, mtp_cache
+        )
+
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
 
     __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
+    cls.mtp_forward_hidden = mtp_forward_hidden
     cls.make_mtp_cache = make_mtp_cache
     # Informational marker for external code that just wants to know "is
     # this class touched by the MTP patch". Idempotency itself uses the

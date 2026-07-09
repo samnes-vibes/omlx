@@ -59,6 +59,22 @@ def is_mtp_active() -> bool:
     return _MTP_ACTIVE
 
 
+# Construction-time draft depth, read by the patched ``__init__`` methods
+# alongside ``_MTP_ACTIVE`` and persisted per instance as
+# ``_omlx_mtp_draft_depth`` so later loads can't change existing models.
+_MTP_DRAFT_DEPTH = 1
+
+
+def set_mtp_draft_depth(depth: int) -> None:
+    """Set the draft depth stamped onto subsequently loaded MTP models."""
+    global _MTP_DRAFT_DEPTH
+    _MTP_DRAFT_DEPTH = max(1, int(depth))
+
+
+def mtp_draft_depth() -> int:
+    return _MTP_DRAFT_DEPTH
+
+
 def apply_mlx_lm_mtp_patch() -> bool:
     """Apply the model-side and BatchGenerator monkey-patches.
 

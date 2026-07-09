@@ -194,9 +194,10 @@ def maybe_apply_pre_load_patches(
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.
-    from ..patches.mlx_lm_mtp import set_mtp_active
+    from ..patches.mlx_lm_mtp import set_mtp_active, set_mtp_draft_depth
 
     set_mtp_active(False)
+    set_mtp_draft_depth(1)
 
     _patch_mlx_lm_load_config()
 
@@ -286,10 +287,15 @@ def maybe_apply_pre_load_patches(
         from ..patches.mlx_lm_mtp import (
             apply_mlx_lm_mtp_patch,
             set_mtp_active,
+            set_mtp_draft_depth,
         )
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
+            if mtp_enabled:
+                set_mtp_draft_depth(
+                    int(getattr(model_settings, "mtp_draft_depth", 1) or 1)
+                )
             if mtp_enabled:
                 logger.info(
                     "Native MTP patch applied for %s (model_type=%s, active)",
