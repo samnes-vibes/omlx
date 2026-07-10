@@ -777,5 +777,16 @@
   "js.error.delete_model_failed": "Error al eliminar el modelo",
   "js.error.delete_model_connection": "Error al eliminar el modelo. Verifica la conexión con el servidor.",
   "js.success.download_started": "Descarga iniciada: {repo_id}",
-  "js.success.settings_saved": "Configuración guardada correctamente"
+  "js.success.settings_saved": "Configuración guardada correctamente",
+  "modal.model_settings.recommendations": "Recommendations",
+  "modal.model_settings.recommendations_loading": "Analyzing…",
+  "modal.model_settings.rec_severity_warn": "Warn",
+  "modal.model_settings.rec_severity_suggest": "Suggest",
+  "modal.model_settings.rec_severity_info": "Info",
+  "modal.model_settings.rec_apply": "Apply",
+  "modal.model_settings.rec_applying": "Applying…",
+  "modal.model_settings.rec_run_tune": "Run tune",
+  "modal.model_settings.rec_tuning": "Tuning…",
+  "modal.model_settings.rec_tune_result": "MTP depth tune result",
+  "modal.model_settings.rec_tune_winner": "winner: depth"
 }

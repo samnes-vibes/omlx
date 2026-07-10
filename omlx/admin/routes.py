@@ -2060,6 +2060,56 @@ async def load_model(
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
 
+@router.get("/api/models/{model_id}/recommendations")
+async def model_recommendations(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Per-model optimization recommendations for the settings modal.
+
+    Pure derivation from existing signals (compat probes, settings, the
+    quantized-MTP-head detector, the MTP tune store) — see
+    docs/experimental/model_optimization_advisor_plan.md.
+    """
+    from ..admin.mtp_tune import load_tuned_depth
+    from ..utils.model_loading import _mtp_weights_quantized
+    from .recommendations import RecommendationContext, build_recommendations
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    settings_manager = _get_settings_manager()
+    settings = settings_manager.get_settings(model_id) if settings_manager else None
+
+    model_info = {"model_path": entry.model_path}
+    mtp_ok, mtp_reason = _mtp_compat_for_model(model_info)
+    dflash_ok, _ = _dflash_compat_for_model(model_info)
+
+    mtp_enabled = bool(getattr(settings, "mtp_enabled", False))
+    ctx = RecommendationContext(
+        mtp_compatible=mtp_ok,
+        mtp_compatibility_reason=mtp_reason,
+        dflash_compatible=dflash_ok,
+        mtp_enabled=mtp_enabled,
+        mtp_draft_depth=getattr(settings, "mtp_draft_depth", 1),
+        dflash_enabled=bool(getattr(settings, "dflash_enabled", False)),
+        vlm_mtp_enabled=bool(getattr(settings, "vlm_mtp_enabled", False)),
+        turboquant_kv_enabled=bool(
+            getattr(settings, "turboquant_kv_enabled", False)
+        ),
+        specprefill_enabled=bool(getattr(settings, "specprefill_enabled", False)),
+        mtp_head_quantized=(
+            mtp_enabled and _mtp_weights_quantized(entry.model_path)
+        ),
+        mtp_tuned_depth=load_tuned_depth(Path(entry.model_path).name),
+    )
+    return {"model_id": model_id, "recommendations": build_recommendations(ctx)}
+
+
 class MtpTuneRequest(BaseModel):
     """Options for the MTP draft-depth tuner (all optional)."""
 

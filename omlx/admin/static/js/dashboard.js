@@ -172,6 +172,12 @@
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            modelRecs: [],
+            modelRecsLoading: false,
+            recError: '',
+            applyingRecId: null,
+            mtpTuneRunning: false,
+            mtpTuneResult: null,
             loadingGenDefaults: false,
             reasoningParsers: [],
 
@@ -1887,6 +1893,80 @@
                     this.computeDrift();
                 }
                 this.showModelSettingsModal = true;
+                if (!isDiffusion) {
+                    this.loadRecommendations(model.id);
+                }
+            },
+
+            async loadRecommendations(modelId) {
+                this.modelRecs = [];
+                this.recError = '';
+                this.mtpTuneResult = null;
+                this.modelRecsLoading = true;
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/recommendations`);
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.modelRecs = data.recommendations || [];
+                    } else if (resp.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (_) { /* network error — panel stays hidden */ }
+                this.modelRecsLoading = false;
+            },
+
+            async applyRecommendation(rec) {
+                if (!this.selectedModel || !rec.action || rec.action.type !== 'settings') return;
+                this.applyingRecId = rec.id;
+                this.recError = '';
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(rec.action.payload),
+                    });
+                    if (resp.ok) {
+                        await this.loadModels();
+                        const refreshed = this.models.find(m => m.id === this.selectedModel.id);
+                        if (refreshed) {
+                            this.selectedModel = refreshed;
+                            this.modelSettings = this.buildModelSettingsState(refreshed, refreshed.settings || {});
+                        }
+                        await this.loadRecommendations(this.selectedModel.id);
+                    } else {
+                        const data = await resp.json().catch(() => ({}));
+                        this.recError = data.detail || 'Failed to apply recommendation';
+                    }
+                } catch (e) {
+                    this.recError = 'Failed to apply recommendation';
+                }
+                this.applyingRecId = null;
+            },
+
+            async runMtpTune() {
+                if (!this.selectedModel || this.mtpTuneRunning) return;
+                this.mtpTuneRunning = true;
+                this.recError = '';
+                this.mtpTuneResult = null;
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/mtp-tune`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}),
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (resp.ok) {
+                        // loadRecommendations clears mtpTuneResult; set it after
+                        // the reload so the depth table stays visible.
+                        await this.loadRecommendations(this.selectedModel.id);
+                        this.mtpTuneResult = data;
+                    } else {
+                        this.recError = data.detail || 'MTP tune failed';
+                    }
+                } catch (e) {
+                    this.recError = 'MTP tune failed';
+                }
+                this.mtpTuneRunning = false;
             },
 
             async saveModelSettings() {

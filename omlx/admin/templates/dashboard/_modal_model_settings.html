@@ -642,6 +642,50 @@
                                 <!-- Experimental Features -->
                                 <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
 
+                                <!-- Optimization recommendations -->
+                                <div x-show="modelRecsLoading || modelRecs.length > 0 || mtpTuneResult || recError" x-cloak
+                                     class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.recommendations') }}</span>
+                                        <span x-show="modelRecsLoading" class="text-xs text-neutral-400">{{ t('modal.model_settings.recommendations_loading') }}</span>
+                                    </div>
+                                    <template x-for="rec in modelRecs" :key="rec.id">
+                                        <div class="flex items-start gap-3 p-3 bg-white rounded-lg border border-neutral-200">
+                                            <span class="flex-shrink-0 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full mt-0.5"
+                                                  :class="{
+                                                      'bg-red-100 text-red-700': rec.severity === 'warn',
+                                                      'bg-amber-100 text-amber-700': rec.severity === 'suggest',
+                                                      'bg-neutral-100 text-neutral-600': rec.severity === 'info',
+                                                  }"
+                                                  x-text="rec.severity === 'warn' ? '{{ t('modal.model_settings.rec_severity_warn') }}' : (rec.severity === 'suggest' ? '{{ t('modal.model_settings.rec_severity_suggest') }}' : '{{ t('modal.model_settings.rec_severity_info') }}')"></span>
+                                            <div class="min-w-0 flex-1">
+                                                <p class="text-sm font-medium text-neutral-700" x-text="rec.title"></p>
+                                                <p class="text-xs text-neutral-500 mt-0.5" x-text="rec.detail"></p>
+                                            </div>
+                                            <button type="button" x-show="rec.action && rec.action.type === 'settings'"
+                                                    @click="applyRecommendation(rec)"
+                                                    :disabled="applyingRecId !== null"
+                                                    class="flex-shrink-0 px-3 py-1.5 text-xs font-medium bg-black text-white rounded-lg hover:bg-neutral-800 transition-colors disabled:opacity-40"
+                                                    x-text="applyingRecId === rec.id ? '{{ t('modal.model_settings.rec_applying') }}' : '{{ t('modal.model_settings.rec_apply') }}'"></button>
+                                            <button type="button" x-show="rec.action && rec.action.type === 'mtp_tune'"
+                                                    @click="runMtpTune()"
+                                                    :disabled="mtpTuneRunning || applyingRecId !== null"
+                                                    class="flex-shrink-0 px-3 py-1.5 text-xs font-medium bg-black text-white rounded-lg hover:bg-neutral-800 transition-colors disabled:opacity-40"
+                                                    x-text="mtpTuneRunning ? '{{ t('modal.model_settings.rec_tuning') }}' : '{{ t('modal.model_settings.rec_run_tune') }}'"></button>
+                                        </div>
+                                    </template>
+                                    <div x-show="mtpTuneResult" x-cloak class="p-3 bg-white rounded-lg border border-neutral-200 text-xs text-neutral-600">
+                                        <span class="font-medium text-neutral-700">{{ t('modal.model_settings.rec_tune_result') }}</span>
+                                        <span x-text="mtpTuneResult ? ` — ${'{{ t('modal.model_settings.rec_tune_winner') }}'} ${mtpTuneResult.winner_depth}` : ''"></span>
+                                        <div class="mt-1">
+                                            <template x-for="[d, tps] in Object.entries(mtpTuneResult?.tps_by_depth || {})" :key="d">
+                                                <span class="inline-block mr-3" x-text="`d${d}: ${Number(tps).toFixed(1)} tok/s`"></span>
+                                            </template>
+                                        </div>
+                                    </div>
+                                    <p x-show="recError" class="text-xs text-red-500" x-text="recError"></p>
+                                </div>
+
                                 <!-- TurboQuant KV Cache -->
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                     <div class="flex items-start justify-between gap-3">
