@@ -25,6 +25,8 @@ Scenarios (all temp=0 so runs are comparable and lossless):
     agent_loop     — stable head + varying tail (simulated tool-output loop)
     multi_turn_edit — conversation with an edited middle turn across runs
     prefix_control — identical prompt every run (strict-prefix; expect ~0 gain)
+    long_context   — ≥16K-token document QA (prefill-bound; for
+                     --setting-key sparse_prefill_enabled A/B)
 
 Scenarios with multiple prompt variants (rag_permuted, agent_loop,
 multi_turn_edit) cycle through their variants across warmup+measured runs
@@ -152,6 +154,35 @@ def _multi_turn_edit_variant(middle):
     ]
 
 
+def _long_context_doc(approx_words: int = 11000) -> str:
+    """Deterministic aperiodic long document (~16K+ tokens) for the
+    long_context scenario — the length regime sparse prefill targets."""
+    import random
+
+    rng = random.Random(7)
+    topics = [
+        "unified memory bandwidth", "scheduler admission", "KV cache spill",
+        "speculative acceptance", "quantization groups", "prefill chunking",
+        "thermal throttling", "tokenizer merges", "rotary embeddings",
+    ]
+    verbs = ["improves", "constrains", "dominates", "amortizes", "regresses"]
+    parts, words, section = [], 0, 0
+    while words < approx_words:
+        section += 1
+        sents = []
+        for _ in range(rng.randint(4, 8)):
+            t1, t2 = rng.sample(topics, 2)
+            sents.append(
+                f"Section {section}: {t1} {rng.choice(verbs)} {t2} beyond "
+                f"{rng.randint(2, 64)} concurrent requests."
+            )
+        parts.append(" ".join(sents))
+        words += len(parts[-1].split())
+    # Needle for a QA check roughly mid-document
+    parts.insert(len(parts) // 2, "NOTE: the magic checkpoint code is TANGERINE-42.")
+    return "\n\n".join(parts)
+
+
 SCENARIOS = {
     "summarize": {
         "messages": [
@@ -186,6 +217,19 @@ SCENARIOS = {
             }
         ],
         "max_tokens": 250,
+    },
+    "long_context": {
+        # ≥16K-token document QA: the prefill-bound regime that prefill-side
+        # features (sparse_prefill_enabled, specprefill_enabled) target.
+        "messages": [
+            {
+                "role": "user",
+                "content": "Context:\n" + _long_context_doc() + "\n\nWhat is "
+                "the magic checkpoint code mentioned in the NOTE? Answer with "
+                "just the code.",
+            }
+        ],
+        "max_tokens": 30,
     },
     "freeform": {
         "messages": [
@@ -283,8 +327,17 @@ def _post_json(url, payload, token=None):
 # ---------------------------------------------------------------------------
 
 
-def run_streaming_completion(base_url, model, messages, max_tokens, token=None):
+def run_streaming_completion(
+    base_url, model, messages, max_tokens, token=None, cache_bust=False
+):
     """One streaming chat completion; returns (ttft_s, decode_s, n_tokens)."""
+    if cache_bust:
+        # Unique text at the *start* of the first message changes the token
+        # prefix, so the server's prefix cache cannot skip any prefill work.
+        import uuid
+
+        messages = [dict(m) for m in messages]
+        messages[0]["content"] = f"[bench {uuid.uuid4().hex}]\n{messages[0]['content']}"
     payload = {
         "model": model,
         "messages": messages,
@@ -325,18 +378,20 @@ def run_streaming_completion(base_url, model, messages, max_tokens, token=None):
     return ttft, max(total - ttft, 1e-9), n_tokens
 
 
-def run_scenario(base_url, model, name, runs, warmup, token=None):
+def run_scenario(base_url, model, name, runs, warmup, token=None, cache_bust=False):
     scenario = SCENARIOS[name]
     max_tokens = scenario["max_tokens"]
     variant_cycle = itertools.cycle(_variants(scenario))
     for _ in range(warmup):
         run_streaming_completion(
-            base_url, model, next(variant_cycle), max_tokens, token=token
+            base_url, model, next(variant_cycle), max_tokens, token=token,
+            cache_bust=cache_bust,
         )
     ttfts, rates, tokens = [], [], []
     for i in range(runs):
         ttft, decode_s, n = run_streaming_completion(
-            base_url, model, next(variant_cycle), max_tokens, token=token
+            base_url, model, next(variant_cycle), max_tokens, token=token,
+            cache_bust=cache_bust,
         )
         ttfts.append(ttft)
         rates.append(n / decode_s)
@@ -406,13 +461,14 @@ def summarize_stats(stats):
     return " ".join(f"{k}={v}" for k, v in stats.items())
 
 
-def run_pass(base_url, model, scenarios, runs, warmup, stats_path, token=None):
+def run_pass(base_url, model, scenarios, runs, warmup, stats_path, token=None,
+             cache_bust=False):
     results = {}
     for name in scenarios:
         print(f"  scenario: {name}")
         fetch_stats(base_url, stats_path, token=token, reset=True)
         results[name] = run_scenario(
-            base_url, model, name, runs, warmup, token=token
+            base_url, model, name, runs, warmup, token=token, cache_bust=cache_bust
         )
         results[name]["stats"] = fetch_stats(base_url, stats_path, token=token)
         print(f"    stats: {summarize_stats(results[name]['stats'])}")
@@ -473,6 +529,12 @@ def main():
         help="admin API path (relative to --base-url) returning feature stats "
         "(default: admin/api/ngram-spec/stats)",
     )
+    ap.add_argument(
+        "--cache-bust",
+        action="store_true",
+        help="prepend a unique nonce to each request so the server's prefix "
+        "cache never skips prefill (required for TTFT/prefill A/Bs)",
+    )
     ap.add_argument("--json", action="store_true", help="emit raw JSON results")
     args = ap.parse_args()
 
@@ -517,14 +579,14 @@ def main():
         time.sleep(2)
         off = run_pass(
             args.base_url, args.model, scenarios, args.runs, args.warmup,
-            args.stats_path, token,
+            args.stats_path, token, cache_bust=args.cache_bust,
         )
         print(f"\n== pass 2: {args.setting_key} ON ==")
         set_setting_enabled(args.base_url, args.model, args.setting_key, True, token=token)
         time.sleep(2)
         on = run_pass(
             args.base_url, args.model, scenarios, args.runs, args.warmup,
-            args.stats_path, token,
+            args.stats_path, token, cache_bust=args.cache_bust,
         )
         print_comparison(off, on)
         if args.json:
@@ -532,7 +594,7 @@ def main():
     else:
         results = run_pass(
             args.base_url, args.model, scenarios, args.runs, args.warmup,
-            args.stats_path, token,
+            args.stats_path, token, cache_bust=args.cache_bust,
         )
         for name, r in results.items():
             print(
