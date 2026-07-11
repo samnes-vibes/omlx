@@ -110,6 +110,99 @@ class TestTuneRules:
         assert "mtp-tune" not in _ids(recs)
 
 
+_TUNE_ENTRY = {
+    "depth": 2,
+    "tps_by_depth": {"0": 100.0, "1": 120.0, "2": 130.0},
+    "tuned_at": "2026-07-10T12:00:00",
+}
+
+
+class TestMeasuredRecommendations:
+    def test_use_auto_carries_measured_numbers(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth=1,
+                mtp_tuned_depth=2,
+                mtp_tune_entry=_TUNE_ENTRY,
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-use-auto")
+        m = rec["measured"]
+        assert m["winner_depth"] == 2
+        assert m["baseline_tps"] == 100.0
+        assert m["gain_pct"] == 30.0
+        assert m["tps_by_depth"]["2"] == 130.0
+        assert m["tuned_at"] == _TUNE_ENTRY["tuned_at"]
+
+    def test_use_auto_without_entry_has_no_measured(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth=1,
+                mtp_tuned_depth=2,
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-use-auto")
+        assert "measured" not in rec
+
+    def test_tuned_optimal_fires_on_auto_with_gain(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth="auto",
+                mtp_tuned_depth=2,
+                mtp_tune_entry=_TUNE_ENTRY,
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-tuned-optimal")
+        assert rec["severity"] == "info"
+        assert rec["action"] is None
+        assert "+30.0%" in rec["title"]
+
+    def test_tuned_optimal_suppressed_when_winner_zero(self):
+        entry = {"depth": 0, "tps_by_depth": {"0": 100.0, "1": 90.0}}
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth="auto",
+                mtp_tuned_depth=0,
+                mtp_tune_entry=entry,
+            )
+        )
+        assert "mtp-tuned-optimal" not in _ids(recs)
+
+    def test_tuned_optimal_suppressed_without_baseline(self):
+        entry = {"depth": 2, "tps_by_depth": {"1": 120.0, "2": 130.0}}
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth="auto",
+                mtp_tuned_depth=2,
+                mtp_tune_entry=entry,
+            )
+        )
+        assert "mtp-tuned-optimal" not in _ids(recs)
+
+    def test_malformed_entry_is_ignored(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth=1,
+                mtp_tuned_depth=2,
+                mtp_tune_entry={"depth": 2, "tps_by_depth": "garbage"},
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-use-auto")
+        assert "measured" not in rec
+
+
 class TestDflashCandidateRule:
     def test_fires_for_dflash_only_model(self):
         recs = build_recommendations(

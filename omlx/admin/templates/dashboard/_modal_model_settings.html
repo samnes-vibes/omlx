@@ -661,6 +661,15 @@
                                             <div class="min-w-0 flex-1">
                                                 <p class="text-sm font-medium text-neutral-700" x-text="rec.title"></p>
                                                 <p class="text-xs text-neutral-500 mt-0.5" x-text="rec.detail"></p>
+                                                <div x-show="rec.measured" x-cloak class="mt-1.5 text-xs text-neutral-500">
+                                                    <template x-for="[d, tps] in Object.entries(rec.measured?.tps_by_depth || {})" :key="d">
+                                                        <span class="inline-block mr-3"
+                                                              :class="Number(d) === rec.measured?.winner_depth ? 'font-semibold text-neutral-700' : ''"
+                                                              x-text="`d${d}: ${Number(tps).toFixed(1)} tok/s`"></span>
+                                                    </template>
+                                                    <span x-show="rec.measured?.tuned_at" class="text-neutral-400"
+                                                          x-text="rec.measured ? `(${'{{ t('modal.model_settings.rec_measured_at') }}'} ${rec.measured.tuned_at})` : ''"></span>
+                                                </div>
                                             </div>
                                             <button type="button" x-show="rec.action && rec.action.type === 'settings'"
                                                     @click="applyRecommendation(rec)"

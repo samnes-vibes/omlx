@@ -2071,7 +2071,7 @@ async def model_recommendations(
     quantized-MTP-head detector, the MTP tune store) — see
     docs/experimental/model_optimization_advisor_plan.md.
     """
-    from ..admin.mtp_tune import load_tuned_depth
+    from ..admin.mtp_tune import load_tune_entry
     from ..utils.model_loading import _mtp_weights_quantized
     from .recommendations import RecommendationContext, build_recommendations
 
@@ -2090,6 +2090,7 @@ async def model_recommendations(
     dflash_ok, _ = _dflash_compat_for_model(model_info)
 
     mtp_enabled = bool(getattr(settings, "mtp_enabled", False))
+    tune_entry = load_tune_entry(Path(entry.model_path).name)
     ctx = RecommendationContext(
         mtp_compatible=mtp_ok,
         mtp_compatibility_reason=mtp_reason,
@@ -2105,7 +2106,10 @@ async def model_recommendations(
         mtp_head_quantized=(
             mtp_enabled and _mtp_weights_quantized(entry.model_path)
         ),
-        mtp_tuned_depth=load_tuned_depth(Path(entry.model_path).name),
+        mtp_tuned_depth=(
+            int(tune_entry["depth"]) if tune_entry is not None else None
+        ),
+        mtp_tune_entry=tune_entry,
     )
     return {"model_id": model_id, "recommendations": build_recommendations(ctx)}
 

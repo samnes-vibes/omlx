@@ -2,8 +2,9 @@
 
 Date: 2026-07-10
 Branch: `feat/mtp-multi-depth`
-Status: **Phase 1 implemented** (2026-07-10) — see implementation notes at
-the end. Phases 2–3 not started.
+Status: **Phase 1 implemented** (2026-07-10); **Phase 2a (measured
+tune-store recommendations) implemented** (2026-07-11) — see implementation
+notes at the end. Phase 2b (A/B trials + SSE) and Phase 3 not started.
 Companion to: [mtplx_adoption_plan.md](mtplx_adoption_plan.md) (the MTP
 auto-tune endpoint this surfaces), [5x_speedup_research.md](5x_speedup_research.md)
 
@@ -70,14 +71,21 @@ Ordering: warn > suggest > info; stable within severity. Rules never
 recommend anything the settings validation would reject (mutual
 exclusions are part of the conditions).
 
-### Phase 2 — measured recommendations (not started)
+### Phase 2 — measured recommendations
 
-Extend the advisor with numbers: after an `mtp-tune` run, include the
-depth×tps table in the recommendation detail; add ngram-spec / DFlash A/B
-trials (perf_bench-style, driven through the engine like `mtp_tune.py`)
-so "suggest" items can be upgraded to "measured +N%" claims. Requires a
-background-run pattern (SSE progress like the benchmark tab) once trials
-take minutes.
+**2a (implemented 2026-07-11):** recommendations carry the tune-store
+numbers. `load_tune_entry()` exposes the full per-(model, machine) entry;
+the rule engine distills it into an optional `measured` field
+(`tps_by_depth`, `winner_depth`/`winner_tps`, `baseline_tps`, `gain_pct`
+vs depth 0, `tuned_at`) attached to `mtp-use-auto`, plus a new
+`mtp-tuned-optimal` info rule ("measured +N% at depth d") when depth is
+already `"auto"` and the tuned winner is > 0. The UI renders the
+depth×tps row (winner bolded) under any recommendation with `measured`.
+
+**2b (not started):** DFlash A/B trials (perf_bench-style, driven through
+the engine like `mtp_tune.py`) so "suggest" items can be upgraded to
+measured claims. Requires a background-run pattern (SSE progress like the
+benchmark tab) once trials take minutes.
 
 ### Phase 3 — apply-as-profile (not started)
 

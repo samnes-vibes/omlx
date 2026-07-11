@@ -788,5 +788,6 @@
   "modal.model_settings.rec_run_tune": "Run tune",
   "modal.model_settings.rec_tuning": "Tuning…",
   "modal.model_settings.rec_tune_result": "MTP depth tune result",
-  "modal.model_settings.rec_tune_winner": "winner: depth"
+  "modal.model_settings.rec_tune_winner": "winner: depth",
+  "modal.model_settings.rec_measured_at": "measured"
 }

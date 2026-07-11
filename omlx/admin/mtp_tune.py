@@ -81,18 +81,28 @@ def _load_store(base_path: Path | None = None) -> dict:
         return {}
 
 
+def load_tune_entry(model_key: str, base_path: Path | None = None) -> dict | None:
+    """Return the full tune-store entry for (model, this machine), or None.
+
+    Shape: ``{"depth": int, "tps_by_depth": {"0": float, ...}, "tuned_at": str}``.
+    """
+    entry = _load_store(base_path).get(model_key, {}).get(hardware_id())
+    if not isinstance(entry, dict):
+        return None
+    try:
+        int(entry["depth"])
+    except Exception:
+        return None
+    return entry
+
+
 def load_tuned_depth(model_key: str, base_path: Path | None = None) -> int | None:
     """Return the tuned depth for (model, this machine), or None if untuned.
 
     0 means "MTP off wins on this machine".
     """
-    entry = _load_store(base_path).get(model_key, {}).get(hardware_id())
-    if entry is None:
-        return None
-    try:
-        return int(entry["depth"])
-    except Exception:
-        return None
+    entry = load_tune_entry(model_key, base_path)
+    return int(entry["depth"]) if entry is not None else None
 
 
 def save_tune_result(

@@ -18,6 +18,8 @@ Recommendation dict shape (consumed by the settings-modal panel):
       "action": {"type": "settings", "payload": {...}}   # single-key PUT
                 | {"type": "mtp_tune"}                    # run tune endpoint
                 | None                                    # advice only
+      "measured": {...} | absent   # P2: tune-store numbers backing the
+                                   # advice (tps_by_depth, gain_pct, ...)
     }
 """
 
@@ -45,10 +47,49 @@ class RecommendationContext:
     mtp_head_quantized: bool = False
     # None = never tuned on this machine; 0 = tuned, MTP-off wins.
     mtp_tuned_depth: int | None = None
+    # Full tune-store entry ({"depth", "tps_by_depth", "tuned_at"}) when
+    # available — lets measured rules quote numbers, not just the winner.
+    mtp_tune_entry: dict | None = None
 
 
 def _any_speculative_on(ctx: RecommendationContext) -> bool:
     return ctx.mtp_enabled or ctx.dflash_enabled or ctx.vlm_mtp_enabled
+
+
+def _tune_measurement(ctx: RecommendationContext) -> dict | None:
+    """Distill the tune-store entry into a ``measured`` payload, or None.
+
+    Gain is the winner's tps relative to the depth-0 (MTP-off) baseline;
+    omitted when the sweep has no depth-0 sample to compare against.
+    """
+    entry = ctx.mtp_tune_entry
+    if not entry or not isinstance(entry.get("tps_by_depth"), dict):
+        return None
+    try:
+        tps_by_depth = {
+            int(k): float(v) for k, v in entry["tps_by_depth"].items()
+        }
+        winner = int(entry["depth"])
+    except Exception:
+        return None
+    if winner not in tps_by_depth:
+        return None
+    measured: dict = {
+        "winner_depth": winner,
+        "winner_tps": round(tps_by_depth[winner], 1),
+        "tps_by_depth": {
+            str(d): round(t, 1) for d, t in sorted(tps_by_depth.items())
+        },
+    }
+    if entry.get("tuned_at"):
+        measured["tuned_at"] = entry["tuned_at"]
+    baseline = tps_by_depth.get(0)
+    if baseline and baseline > 0:
+        measured["baseline_tps"] = round(baseline, 1)
+        measured["gain_pct"] = round(
+            (tps_by_depth[winner] - baseline) / baseline * 100, 1
+        )
+    return measured
 
 
 def build_recommendations(ctx: RecommendationContext) -> list[dict]:
@@ -115,6 +156,7 @@ def build_recommendations(ctx: RecommendationContext) -> list[dict]:
         and ctx.mtp_draft_depth != "auto"
     ):
         winner_off = ctx.mtp_tuned_depth == 0
+        measured = _tune_measurement(ctx)
         recs.append(
             {
                 "id": "mtp-use-auto",
@@ -143,8 +185,40 @@ def build_recommendations(ctx: RecommendationContext) -> list[dict]:
                     "type": "settings",
                     "payload": {"mtp_draft_depth": "auto"},
                 },
+                **({"measured": measured} if measured else {}),
             }
         )
+
+    if (
+        ctx.mtp_enabled
+        and ctx.mtp_draft_depth == "auto"
+        and ctx.mtp_tuned_depth is not None
+        and ctx.mtp_tuned_depth > 0
+    ):
+        measured = _tune_measurement(ctx)
+        if measured is not None and "gain_pct" in measured:
+            recs.append(
+                {
+                    "id": "mtp-tuned-optimal",
+                    "severity": "info",
+                    "title": (
+                        f"MTP tuned: measured {measured['gain_pct']:+.1f}% "
+                        f"at depth {measured['winner_depth']}"
+                    ),
+                    "detail": (
+                        f"The depth tuner measured "
+                        f"{measured['winner_tps']:.1f} tok/s at depth "
+                        f"{measured['winner_depth']} vs "
+                        f"{measured['baseline_tps']:.1f} tok/s without MTP "
+                        f"on this machine ({measured['gain_pct']:+.1f}%). "
+                        'mtp_draft_depth is "auto", so this depth is already '
+                        "in use. Re-run the tuner if the hardware or "
+                        "checkpoint changes."
+                    ),
+                    "action": None,
+                    "measured": measured,
+                }
+            )
 
     if (
         ctx.dflash_compatible
