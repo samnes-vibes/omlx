@@ -642,6 +642,41 @@
                                 <!-- Experimental Features -->
                                 <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
 
+                                <!-- Capability matrix (advisor P4) -->
+                                <div x-show="modelCapsLoading || modelCaps.length > 0" x-cloak
+                                     class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.capabilities') }}</span>
+                                        <span x-show="modelCapsLoading" class="text-xs text-neutral-400">{{ t('modal.model_settings.capabilities_loading') }}</span>
+                                    </div>
+                                    <template x-for="cap in modelCaps" :key="cap.feature">
+                                        <div class="flex items-start gap-3 p-3 bg-white rounded-lg border border-neutral-200">
+                                            <span class="flex-shrink-0 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full mt-0.5"
+                                                  :class="{
+                                                      'bg-green-100 text-green-700': cap.status === 'active',
+                                                      'bg-blue-100 text-blue-700': cap.status === 'available',
+                                                      'bg-amber-100 text-amber-700': cap.status === 'needs-config',
+                                                      'bg-orange-100 text-orange-700': cap.status === 'needs-different-checkpoint',
+                                                      'bg-neutral-100 text-neutral-500': cap.status === 'unsupported',
+                                                  }"
+                                                  x-text="cap.status === 'active' ? '{{ t('modal.model_settings.cap_status_active') }}'
+                                                          : (cap.status === 'available' ? '{{ t('modal.model_settings.cap_status_available') }}'
+                                                          : (cap.status === 'needs-config' ? '{{ t('modal.model_settings.cap_status_needs_config') }}'
+                                                          : (cap.status === 'needs-different-checkpoint' ? '{{ t('modal.model_settings.cap_status_needs_checkpoint') }}'
+                                                          : '{{ t('modal.model_settings.cap_status_unsupported') }}')))"></span>
+                                            <div class="min-w-0 flex-1">
+                                                <p class="text-sm font-medium text-neutral-700" x-text="cap.label"></p>
+                                                <p class="text-xs text-neutral-500 mt-0.5" x-text="cap.reason"></p>
+                                                <ul x-show="cap.catalog && cap.catalog.length" x-cloak class="mt-1.5 text-xs text-neutral-500 list-disc list-inside">
+                                                    <template x-for="item in (cap.catalog || [])" :key="item">
+                                                        <li x-text="item"></li>
+                                                    </template>
+                                                </ul>
+                                            </div>
+                                        </div>
+                                    </template>
+                                </div>
+
                                 <!-- Optimization recommendations -->
                                 <div x-show="modelRecsLoading || modelRecs.length > 0 || mtpTuneResult || recError" x-cloak
                                      class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">

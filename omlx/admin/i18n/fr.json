@@ -790,5 +790,12 @@
   "modal.model_settings.rec_tune_result": "MTP depth tune result",
   "modal.model_settings.rec_tune_winner": "winner: depth",
   "modal.model_settings.rec_measured_at": "measured",
-  "modal.model_settings.rec_apply_all": "Apply all as profile"
+  "modal.model_settings.rec_apply_all": "Apply all as profile",
+  "modal.model_settings.capabilities": "Capabilities",
+  "modal.model_settings.capabilities_loading": "Checking…",
+  "modal.model_settings.cap_status_active": "Active",
+  "modal.model_settings.cap_status_available": "Available",
+  "modal.model_settings.cap_status_needs_config": "Needs config",
+  "modal.model_settings.cap_status_needs_checkpoint": "Needs checkpoint",
+  "modal.model_settings.cap_status_unsupported": "Unsupported"
 }

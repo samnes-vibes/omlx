@@ -2126,6 +2126,101 @@ async def model_recommendations(
     }
 
 
+def _config_is_moe(cfg: dict) -> bool:
+    """True when the config (or nested text_config) declares routed experts."""
+    for scope in (cfg, cfg.get("text_config") or {}):
+        for key in ("num_experts", "num_local_experts", "n_routed_experts"):
+            if int(scope.get(key, 0) or 0) > 1:
+                return True
+    return False
+
+
+def _build_capabilities_for(model_id: str) -> list[dict]:
+    """Gather structured model facts and run the capability engine (P4)."""
+    import json
+
+    from ..utils.model_loading import (
+        _has_mtp_heads,
+        _is_mtp_compatible,
+        _mtp_weights_quantized,
+    )
+    from .capabilities import CapabilityContext, build_capabilities
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    model_path = Path(entry.model_path)
+    try:
+        cfg = json.loads((model_path / "config.json").read_text())
+    except Exception:
+        cfg = {}
+    model_type = cfg.get("model_type")
+
+    is_paro, paro_reason = _paroquant_compat_for_model(
+        {"model_path": str(model_path)}
+    )
+    try:
+        from ..engine.dflash import is_dflash_compatible
+
+        dflash_ok, dflash_reason = is_dflash_compatible(model_path)
+    except ImportError:
+        dflash_ok, dflash_reason = False, "dflash-mlx is not installed"
+
+    has_heads = _has_mtp_heads(cfg)
+    arch_ok = has_heads and _is_mtp_compatible(cfg, model_type)
+    weights_ok = arch_ok and _model_has_mtp_weight_tensors(model_path)
+    head_quantized = weights_ok and _mtp_weights_quantized(str(model_path))
+
+    settings_manager = _get_settings_manager()
+    settings = settings_manager.get_settings(model_id) if settings_manager else None
+
+    ctx = CapabilityContext(
+        model_type=model_type,
+        has_vision=bool(cfg.get("vision_config")),
+        is_moe=_config_is_moe(cfg),
+        is_paroquant=is_paro,
+        paroquant_reason=paro_reason,
+        has_mtp_heads=has_heads,
+        mtp_arch_supported=arch_ok,
+        mtp_weights_present=weights_ok,
+        mtp_head_quantized=head_quantized,
+        dflash_supported=dflash_ok,
+        dflash_reason=dflash_reason,
+        mtp_enabled=bool(getattr(settings, "mtp_enabled", False)),
+        dflash_enabled=bool(getattr(settings, "dflash_enabled", False)),
+        dflash_draft_model=getattr(settings, "dflash_draft_model", None),
+        vlm_mtp_enabled=bool(getattr(settings, "vlm_mtp_enabled", False)),
+        vlm_mtp_draft_model=getattr(settings, "vlm_mtp_draft_model", None),
+        specprefill_enabled=bool(getattr(settings, "specprefill_enabled", False)),
+        specprefill_draft_model=getattr(settings, "specprefill_draft_model", None),
+        turboquant_kv_enabled=bool(
+            getattr(settings, "turboquant_kv_enabled", False)
+        ),
+    )
+    return build_capabilities(ctx)
+
+
+@router.get("/api/models/{model_id}/capabilities")
+async def model_capabilities(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Per-feature capability matrix for the settings modal (advisor P4).
+
+    Answers "what can this model do and why not" with a status enum per
+    optimization feature, plus catalog hints on what checkpoint to load
+    when the blocker is the checkpoint rather than the architecture.
+    """
+    return {
+        "model_id": model_id,
+        "capabilities": _build_capabilities_for(model_id),
+    }
+
+
 @router.post("/api/models/{model_id}/recommendations/apply-all")
 async def apply_all_recommendations(
     model_id: str,

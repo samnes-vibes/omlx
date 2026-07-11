@@ -174,6 +174,8 @@
             savingModelSettings: false,
             modelRecs: [],
             modelRecsLoading: false,
+            modelCaps: [],
+            modelCapsLoading: false,
             recError: '',
             applyingRecId: null,
             mtpTuneRunning: false,
@@ -1895,7 +1897,23 @@
                 this.showModelSettingsModal = true;
                 if (!isDiffusion) {
                     this.loadRecommendations(model.id);
+                    this.loadCapabilities(model.id);
                 }
+            },
+
+            async loadCapabilities(modelId) {
+                this.modelCaps = [];
+                this.modelCapsLoading = true;
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/capabilities`);
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.modelCaps = data.capabilities || [];
+                    } else if (resp.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (_) { /* network error — panel stays hidden */ }
+                this.modelCapsLoading = false;
             },
 
             async loadRecommendations(modelId) {
