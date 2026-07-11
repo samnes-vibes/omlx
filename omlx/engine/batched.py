@@ -309,6 +309,17 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
+        # N-gram / prompt-lookup speculative decoding (draft-model-free).
+        if self._model_settings is not None and getattr(
+            self._model_settings, "ngram_spec_enabled", False
+        ):
+            try:
+                from ..patches.ngram_spec import activate_ngram_spec
+
+                activate_ngram_spec(self._model, self._model_settings)
+            except Exception:
+                logger.warning("NgramSpec activation failed", exc_info=True)
+
         # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
         # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
         # below their context window. Installed after TurboQuant so it is the
@@ -364,6 +375,21 @@ class BatchedEngine(BaseEngine):
                 )
                 scheduler._set_model_info_for_monitor()
         scheduler.refresh_ssd_layer_signature()
+
+        # CacheBlend-style chunk-KV reuse: propagate to scheduler (Phase 3,
+        # see docs/experimental/cacheblend_plan.md). Prefill-side only --
+        # nothing to activate on the model itself, unlike the decode-time
+        # patches above.
+        if self._model_settings is not None:
+            scheduler._chunk_kv_reuse_enabled = bool(
+                getattr(self._model_settings, "chunk_kv_reuse_enabled", False)
+            )
+            scheduler._chunk_kv_recompute_pct = float(
+                getattr(self._model_settings, "chunk_kv_recompute_pct", None) or 0.15
+            )
+            scheduler._chunk_kv_min_chunk_tokens = int(
+                getattr(self._model_settings, "chunk_kv_min_chunk_tokens", None) or 256
+            )
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -510,6 +536,81 @@ class BatchedEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
 
+    def _compute_message_token_offsets(
+        self,
+        messages: list[dict[str, Any]],
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        prompt: str,
+    ) -> list[int] | None:
+        """Token offsets where each chat message begins in the rendered prompt.
+
+        Chunk-KV reuse (CacheBlend, docs/experimental/cacheblend_plan.md)
+        needs stable content-aligned chunk boundaries; message starts are the
+        natural ones. Computed by rendering each messages[:i] prefix with the
+        same template kwargs as the full prompt (minus the generation prompt)
+        and validating twice — the rendered prefix must be a string prefix of
+        the full prompt, and its token ids must be a prefix of the full
+        prompt's token ids (BPE merges across a boundary would silently
+        misalign the offset otherwise). Boundaries failing either check are
+        dropped rather than guessed; None disables message chunking for the
+        request entirely.
+
+        Cost is one extra encode of the full prompt plus a render+encode per
+        message prefix — only paid when chunk_kv_reuse_enabled, never on the
+        default path (see the chat()/stream_chat() call sites).
+        """
+        if not isinstance(prompt, str) or len(messages) < 2:
+            return None
+        if not hasattr(self._tokenizer, "apply_chat_template"):
+            return None
+        try:
+            full_ids = list(self._tokenizer.encode(prompt))
+            template_kwargs: dict[str, Any] = {
+                "tokenize": False,
+                "add_generation_prompt": False,
+            }
+            if template_tools:
+                template_kwargs["tools"] = template_tools
+            if self._enable_thinking is not None:
+                template_kwargs["enable_thinking"] = self._enable_thinking
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
+
+            offsets: list[int] = []
+            for i in range(1, len(messages)):
+                try:
+                    rendered = self._tokenizer.apply_chat_template(
+                        messages[:i], **template_kwargs
+                    )
+                except TypeError:
+                    # Mirror _apply_chat_template's unsupported-kwarg retry.
+                    retry_kwargs = dict(template_kwargs)
+                    if chat_template_kwargs:
+                        for key in chat_template_kwargs:
+                            retry_kwargs.pop(key, None)
+                    retry_kwargs.pop("tools", None)
+                    retry_kwargs.pop("enable_thinking", None)
+                    rendered = self._tokenizer.apply_chat_template(
+                        messages[:i], **retry_kwargs
+                    )
+                if not isinstance(rendered, str) or not prompt.startswith(rendered):
+                    continue
+                prefix_ids = list(self._tokenizer.encode(rendered))
+                n = len(prefix_ids)
+                if 0 < n < len(full_ids) and full_ids[:n] == prefix_ids:
+                    offsets.append(n)
+            return offsets or None
+        except Exception as e:
+            logger.debug("message_token_offsets computation failed: %s", e)
+            return None
+
+    def _chunk_kv_reuse_enabled(self) -> bool:
+        return bool(
+            self._model_settings is not None
+            and getattr(self._model_settings, "chunk_kv_reuse_enabled", False)
+        )
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -592,9 +693,16 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        extra_request_kwargs = {}
+        if kwargs.get("message_token_offsets") is not None:
+            extra_request_kwargs["message_token_offsets"] = kwargs[
+                "message_token_offsets"
+            ]
+
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            **extra_request_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -677,6 +785,11 @@ class BatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop(
                 "specprefill_system_end"
             )
+
+        if kwargs.get("message_token_offsets") is not None:
+            specprefill_kwargs["message_token_offsets"] = kwargs[
+                "message_token_offsets"
+            ]
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -775,6 +888,14 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
+
+        # Chunk-KV reuse: message-boundary chunking needs to know where each
+        # message starts in the token stream. Only computed when the feature
+        # is on (costs extra template renders + encodes).
+        if self._chunk_kv_reuse_enabled():
+            kwargs["message_token_offsets"] = self._compute_message_token_offsets(
+                messages, template_tools, ct_kwargs, prompt
+            )
 
         return await self.generate(
             prompt=prompt,
@@ -951,6 +1072,12 @@ class BatchedEngine(BaseEngine):
                         kwargs["specprefill_system_end"] = system_end
                 except Exception as e:
                     logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+
+        # Chunk-KV reuse: see the identical block in chat().
+        if self._chunk_kv_reuse_enabled():
+            kwargs["message_token_offsets"] = self._compute_message_token_offsets(
+                messages, template_tools, ct_kwargs, prompt
+            )
 
         async for output in self.stream_generate(
             prompt=prompt,

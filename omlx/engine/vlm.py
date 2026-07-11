@@ -1460,6 +1460,18 @@ class VLMBatchedEngine(BaseEngine):
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
 
+        # N-gram / prompt-lookup speculative decoding (draft-model-free).
+        # Config goes on the adapter — that is the model BatchGenerator sees.
+        if self._model_settings is not None and getattr(
+            self._model_settings, "ngram_spec_enabled", False
+        ):
+            try:
+                from ..patches.ngram_spec import activate_ngram_spec
+
+                activate_ngram_spec(self._adapter, self._model_settings)
+            except Exception:
+                logger.warning("NgramSpec activation failed", exc_info=True)
+
         # Create scheduler config
         scheduler_config = (
             copy.copy(self._scheduler_config)

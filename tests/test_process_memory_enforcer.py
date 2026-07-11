@@ -769,9 +769,13 @@ class TestPrefillMemoryGuardToggle:
 class TestStaticCeiling:
     """Tier-driven static ceiling (`total_ram - tier.static_reserve`).
 
-    >= 24 GB systems use a tier-scaled reserve. < 24 GB systems always
-    use a 4 GB reserve regardless of tier.
+    >= 24 GB systems use a tier-scaled reserve (8/6/4 GB for
+    safe/balanced/aggressive). < 24 GB systems use a smaller tier-scaled
+    reserve of their own (4/3.5/3 GB) since they can't spare as much in
+    absolute terms, but the tier still matters (#lowram perf pass).
     """
+
+    _SMALL_SYSTEM_RESERVE_GB = {"safe": 4, "balanced": 3.5, "aggressive": 3}
 
     @pytest.mark.parametrize(
         "tier,expected_reserve_gb",
@@ -789,31 +793,29 @@ class TestStaticCeiling:
         assert result == (96 - expected_reserve_gb) * 1024**3
 
     @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
-    def test_small_system_uses_4gb_reserve_regardless_of_tier(
-        self, mock_engine_pool, tier
-    ):
+    def test_small_system_uses_tier_scaled_reserve(self, mock_engine_pool, tier):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier=tier
         )
         with patch("omlx.settings.get_system_memory") as mock_mem:
             mock_mem.return_value = 12 * 1024**3
             result = enforcer._get_static_ceiling()
-        assert result == 8 * 1024**3
+        expected_reserve = int(self._SMALL_SYSTEM_RESERVE_GB[tier] * 1024**3)
+        assert result == 12 * 1024**3 - expected_reserve
 
     @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
-    def test_16gb_system_uses_4gb_reserve_regardless_of_tier(
-        self, mock_engine_pool, tier
-    ):
+    def test_16gb_system_uses_tier_scaled_reserve(self, mock_engine_pool, tier):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier=tier
         )
         with patch("omlx.settings.get_system_memory") as mock_mem:
             mock_mem.return_value = 16 * 1024**3
             result = enforcer._get_static_ceiling()
-        assert result == 12 * 1024**3
+        expected_reserve = int(self._SMALL_SYSTEM_RESERVE_GB[tier] * 1024**3)
+        assert result == 16 * 1024**3 - expected_reserve
 
     @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
-    def test_between_16gb_and_24gb_system_uses_4gb_reserve_regardless_of_tier(
+    def test_between_16gb_and_24gb_system_uses_tier_scaled_reserve(
         self, mock_engine_pool, tier
     ):
         enforcer = ProcessMemoryEnforcer(
@@ -822,16 +824,17 @@ class TestStaticCeiling:
         with patch("omlx.settings.get_system_memory") as mock_mem:
             mock_mem.return_value = 16 * 1024**3 + 256 * 1024**2
             result = enforcer._get_static_ceiling()
-        assert result == 12 * 1024**3 + 256 * 1024**2
+        expected_reserve = int(self._SMALL_SYSTEM_RESERVE_GB[tier] * 1024**3)
+        assert result == 16 * 1024**3 + 256 * 1024**2 - expected_reserve
 
-    def test_18gb_system_uses_4gb_reserve(self, mock_engine_pool):
+    def test_18gb_system_uses_balanced_reserve(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
         with patch("omlx.settings.get_system_memory") as mock_mem:
             mock_mem.return_value = 18 * 1024**3
             result = enforcer._get_static_ceiling()
-        assert result == 14 * 1024**3
+        assert result == 18 * 1024**3 - int(3.5 * 1024**3)
 
     def test_24gb_system_uses_tier_reserve(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(

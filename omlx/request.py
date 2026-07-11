@@ -137,6 +137,12 @@ class Request:
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
 
+    # Chunk-KV reuse (CacheBlend): token offsets where each chat-template
+    # message begins in prompt_token_ids, plumbed from the engine's chat
+    # path when chunk_kv_reuse_enabled. Used to chunk the prompt at message
+    # boundaries for content-hash store/lookup instead of fixed blocks.
+    message_token_offsets: Optional[List[int]] = None
+
     # Multimodal content (images, video)
     images: Optional[List[Any]] = None
     videos: Optional[List[Any]] = None

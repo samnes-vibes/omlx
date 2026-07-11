@@ -48,10 +48,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Reserve sub-24 GB systems regardless of tier. Small Macs cannot afford a
-# tier-scaled cut and still load any useful model.
-_SMALL_SYSTEM_RESERVE = 4 * 1024**3
 _SMALL_SYSTEM_THRESHOLD = 24 * 1024**3
+
+# Tier map: static reserve for systems below the small-system threshold.
+# Smaller than _STATIC_RESERVE_LARGE at every tier since these machines
+# can't spare as much in absolute terms, but the tier still controls how
+# much of the reserve the user is willing to give back for more headroom.
+# `custom` bypasses this map entirely (see _get_static_ceiling).
+_STATIC_RESERVE_SMALL: dict[str, int] = {
+    "safe": 4 * 1024**3,
+    "balanced": int(3.5 * 1024**3),
+    "aggressive": 3 * 1024**3,
+}
 
 # Tier map: static reserve for systems at or above the small-system threshold.
 # `custom` shares the `balanced` reserve so the static cap stays sane
@@ -495,7 +503,7 @@ class ProcessMemoryEnforcer:
         if self._memory_guard_tier == "custom":
             return max(0, system_bytes - _STATIC_RESERVE_LARGE["custom"])
         if system_bytes < _SMALL_SYSTEM_THRESHOLD:
-            reserve = _SMALL_SYSTEM_RESERVE
+            reserve = _STATIC_RESERVE_SMALL[self._memory_guard_tier]
         else:
             reserve = _STATIC_RESERVE_LARGE[self._memory_guard_tier]
         return max(0, system_bytes - reserve)

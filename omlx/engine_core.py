@@ -529,6 +529,7 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        message_token_offsets: Optional[List[int]] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -566,6 +567,7 @@ class EngineCore:
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            message_token_offsets=message_token_offsets,
         )
 
         # SpecPrefill: resolve per-request settings.

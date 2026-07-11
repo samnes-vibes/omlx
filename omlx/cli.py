@@ -843,7 +843,7 @@ Example directory structure:
         "--max-concurrent-requests",
         type=int,
         default=None,
-        help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
+        help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8, or 4 on systems with <24GB RAM)",
     )
     serve_parser.add_argument(
         "--embedding-batch-size",

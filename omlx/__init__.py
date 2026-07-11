@@ -14,6 +14,12 @@ Features:
 
 from omlx._version import __version__
 
+# Must run before any submodule imports mlx_lm (which imports transformers
+# and registers NewlineTokenizer with a call transformers rejects). See
+# omlx/_transformers_compat.py for why.
+from omlx._transformers_compat import install as _install_transformers_compat
+_install_transformers_compat()
+
 _LAZY = {
     "Request": "omlx.request",
     "RequestOutput": "omlx.request",

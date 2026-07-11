@@ -63,6 +63,10 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_verify_mode",
     "mtp_enabled",
     "mtp_draft_depth",
+    "ngram_spec_enabled",
+    "ngram_spec_min_n",
+    "ngram_spec_max_n",
+    "ngram_spec_max_draft",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
@@ -71,6 +75,9 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_keep_pct",
     "specprefill_threshold",
     "index_cache_freq",
+    "chunk_kv_reuse_enabled",
+    "chunk_kv_recompute_pct",
+    "chunk_kv_min_chunk_tokens",
 )
 
 # Excluded — never stored in a profile or template.

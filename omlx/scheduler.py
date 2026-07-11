@@ -1486,6 +1486,11 @@ class Scheduler:
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
+        # CacheBlend-style chunk-KV reuse (set by engine if model_settings has
+        # it enabled; see docs/experimental/cacheblend_plan.md Phase 3).
+        self._chunk_kv_reuse_enabled: bool = False
+        self._chunk_kv_recompute_pct: float = 0.15
+        self._chunk_kv_min_chunk_tokens: int = 256
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
@@ -1991,6 +1996,7 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
+        message_token_offsets: list[int] | None = None,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -2045,6 +2051,8 @@ class Scheduler:
                         extra_keys=extra_keys,
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
+                        message_token_offsets=message_token_offsets,
+                        message_chunk_min_tokens=self._chunk_kv_min_chunk_tokens,
                     )
                 else:
                     block_table = self.block_aware_cache.store_cache(
@@ -2057,6 +2065,8 @@ class Scheduler:
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
                         hot_cache_write_back=False,
+                        message_token_offsets=message_token_offsets,
+                        message_chunk_min_tokens=self._chunk_kv_min_chunk_tokens,
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -3196,6 +3206,129 @@ class Scheduler:
                 _materialize_cache_storage(prompt_cache)
 
         return prompt_cache, last_token
+
+    def _do_prefill_with_chunk_reuse(
+        self,
+        request: "Request",
+        tokens: list[int],
+        existing_cache: list[Any] | None,
+        vlm_embeds: tuple[mx.array, dict[str, Any], int] | None,
+    ) -> tuple[list[Any], list[int]]:
+        """
+        CacheBlend-style non-prefix KV reuse (Phase 3; see
+        docs/experimental/cacheblend_plan.md). Same call contract as
+        `_do_external_prefill` — this is a drop-in alternative, tried first
+        when the feature is enabled, that falls back to the unmodified
+        `_do_external_prefill` for anything ineligible or where the attempt
+        doesn't pan out (including any unexpected exception). The flag-off /
+        no-hit path must be byte-identical to before this feature existed,
+        so every early-out below delegates to `_do_external_prefill` with the
+        original, untouched `existing_cache` rather than any partially built
+        state of its own.
+
+        Deliberately narrow in v1 (see the "minimal isolated hook" scoping
+        in the plan doc): only requests that would already take the
+        single-shot external-prefill path reach this method (the multi-step
+        chunked_prefill state machine is untouched); VLM and TurboQuant
+        requests, and models with any rotating/sliding-window cache layer,
+        always fall back.
+        """
+        if (
+            vlm_embeds is not None
+            or self._turboquant_kv_bits is not None
+            or self.paged_ssd_cache_manager is None
+            or len(tokens) <= 1
+        ):
+            return self._do_external_prefill(
+                request, tokens, existing_cache, vlm_embeds=vlm_embeds
+            )
+
+        try:
+            from .cache.kv_reuse import (
+                chunks_with_manager_hits,
+                execute_chunk_prefill_plan,
+                is_chunk_reuse_eligible,
+                plan_chunk_prefill,
+                record_chunk_reuse_attempt,
+            )
+
+            if existing_cache is not None:
+                if not is_chunk_reuse_eligible(existing_cache):
+                    return self._do_external_prefill(
+                        request, tokens, existing_cache, vlm_embeds=vlm_embeds
+                    )
+                # Shallow-copy each layer's cache object (NOT the underlying
+                # K/V arrays -- those are only ever replaced, never mutated
+                # in place, by both `model()` forwards and
+                # `_splice_reuse_step`) so a plan that fails partway through
+                # never leaves the caller's `existing_cache` objects
+                # mutated. Falling back after a partial failure must be
+                # able to hand `_do_external_prefill` the pristine original.
+                working_cache = [copy.copy(c) for c in existing_cache]
+            else:
+                working_cache = make_prompt_cache(self.model)
+                if not is_chunk_reuse_eligible(working_cache):
+                    return self._do_external_prefill(
+                        request, tokens, existing_cache, vlm_embeds=vlm_embeds
+                    )
+
+            # Mirror _do_external_prefill's contract: hold out the last
+            # token for insert()'s first decode step.
+            prefill_tokens = tokens[:-1]
+            last_token = tokens[-1:]
+
+            block_size = self.config.paged_cache_block_size or 256
+
+            # Message-boundary chunking (when the request carries offsets):
+            # aligns lookup chunks with the message-aligned content chunks
+            # the store path saves, so shared content hits regardless of
+            # its fixed-block phase. Offsets are absolute in the prompt;
+            # `tokens` may be the prefix-cache-trimmed remainder, so shift
+            # them onto the remainder's coordinates first.
+            msg_offsets = getattr(request, "message_token_offsets", None)
+            relative_offsets = None
+            if msg_offsets and request.prompt_token_ids:
+                base = len(request.prompt_token_ids) - len(tokens)
+                if base >= 0:
+                    relative_offsets = [o - base for o in msg_offsets if o > base]
+
+            chunk_hits = chunks_with_manager_hits(
+                prefill_tokens,
+                self.paged_ssd_cache_manager,
+                block_size,
+                message_token_offsets=relative_offsets,
+            )
+            hit_count = sum(1 for _, hit in chunk_hits if hit is not None)
+            if hit_count == 0:
+                # Nothing to reuse: only the (cheap) chunking/lookup ran, no
+                # forward pass wasted, no cache touched. Behaves exactly
+                # like the flag being off.
+                return self._do_external_prefill(
+                    request, tokens, existing_cache, vlm_embeds=vlm_embeds
+                )
+
+            plan = plan_chunk_prefill(chunk_hits, recompute_pct=self._chunk_kv_recompute_pct)
+            forwarded = execute_chunk_prefill_plan(
+                self.model, working_cache, plan, self.paged_ssd_cache_manager
+            )
+            tokens_reused = len(prefill_tokens) - forwarded
+            record_chunk_reuse_attempt(
+                chunks_total=len(chunk_hits),
+                chunks_hit=hit_count,
+                tokens_reused=tokens_reused,
+                tokens_forwarded=forwarded,
+            )
+            return working_cache, last_token
+        except Exception as e:
+            logger.warning(
+                "Chunk-KV reuse prefill failed for %s, falling back to normal "
+                "prefill: %s",
+                request.request_id,
+                e,
+            )
+            return self._do_external_prefill(
+                request, tokens, existing_cache, vlm_embeds=vlm_embeds
+            )
 
     # ------------------------------------------------------------------
     # Adaptive prefill throttle
@@ -8061,12 +8194,20 @@ class Scheduler:
                 self.uid_to_request_id[temp_uid] = request.request_id
 
                 try:
-                    prefilled_cache, last_token = self._do_external_prefill(
-                        request,
-                        tokens_to_process,
-                        cache_to_use,
-                        vlm_embeds=vlm_embeds,
-                    )
+                    if self._chunk_kv_reuse_enabled:
+                        prefilled_cache, last_token = self._do_prefill_with_chunk_reuse(
+                            request,
+                            tokens_to_process,
+                            cache_to_use,
+                            vlm_embeds,
+                        )
+                    else:
+                        prefilled_cache, last_token = self._do_external_prefill(
+                            request,
+                            tokens_to_process,
+                            cache_to_use,
+                            vlm_embeds=vlm_embeds,
+                        )
                 except _PrefillAbortedError:
                     self._cleanup_prefill_abort_request(request, temp_uid=temp_uid)
                     continue
@@ -8710,6 +8851,11 @@ class Scheduler:
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
                                         hot_cache_write_back,
+                                        (
+                                            request.message_token_offsets
+                                            if self._chunk_kv_reuse_enabled
+                                            else None
+                                        ),
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -8740,6 +8886,11 @@ class Scheduler:
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
                                     hot_cache_write_back,
+                                    (
+                                        request.message_token_offsets
+                                        if self._chunk_kv_reuse_enabled
+                                        else None
+                                    ),
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "

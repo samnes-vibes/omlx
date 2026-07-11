@@ -97,6 +97,19 @@ class ModelSettings:
             The string "auto" resolves at load time to the per-(model, machine)
             depth tuned via POST /admin/api/models/{id}/mtp-tune (untuned =
             depth 1; a tuned winner of 0 resolves to MTP off on this machine).
+        ngram_spec_enabled: Enable n-gram / prompt-lookup speculative decoding
+            (draft-model-free; drafts from the request's own token stream).
+            Mutually exclusive with mtp_enabled, dflash_enabled and vlm_mtp_enabled.
+        ngram_spec_min_n: Shortest n-gram to match (None = default 2).
+        ngram_spec_max_n: Longest n-gram to match (None = default 4).
+        ngram_spec_max_draft: Max draft tokens proposed per cycle (None = default 8).
+        chunk_kv_reuse_enabled: Enable CacheBlend-style non-prefix KV reuse
+            (experimental, prefill-side). Mutually exclusive with
+            dflash_enabled and turboquant_kv_enabled.
+        chunk_kv_recompute_pct: Fraction of each reused chunk's tokens to
+            recompute to repair cross-chunk attention (None = default 0.15).
+        chunk_kv_min_chunk_tokens: Fixed chunk size for the fallback
+            (non-message-boundary) chunker (None = default 256).
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model.
@@ -209,6 +222,32 @@ class ModelSettings:
     # Only 1 is supported on DeepSeek-V4 in this version; deeper values are
     # clamped to 1 at decode time for models without chained-draft support.
     mtp_draft_depth: int | str = 1
+    # N-gram / prompt-lookup speculative decoding (draft-model-free). Drafts
+    # come from matching the recent token suffix against the prompt +
+    # generation history; the target model verifies them in one forward.
+    # Works on any architecture whose caches can roll back (trimmable KV, or
+    # hybrid GDN models exposing rollback_speculative_cache). Effective on
+    # echo-heavy workloads (summarization, code edit, RAG); ~neutral elsewhere.
+    # Mutually exclusive with the other speculative-decoding paths.
+    ngram_spec_enabled: bool = False
+    ngram_spec_min_n: Optional[int] = None  # None = default 2
+    ngram_spec_max_n: Optional[int] = None  # None = default 4
+    ngram_spec_max_draft: Optional[int] = None  # None = default 8
+
+    # CacheBlend-style non-prefix KV reuse (experimental, prefill-side; see
+    # docs/experimental/cacheblend_plan.md). Reuses precomputed per-chunk KV
+    # regardless of its position in the prompt, RoPE-shifting stored K to the
+    # new position and recomputing only a small leading fraction of each
+    # reused chunk to repair cross-chunk attention. Orthogonal to the
+    # decode-side speculative paths (ngram_spec, mtp, dflash) — this only
+    # touches prefill — but incompatible with dflash (owns its own
+    # engine/cache) and TurboQuant KV (v1 cannot RoPE-shift quantized KV
+    # without a dequant round-trip; see the plan's "Later" section).
+    # NOTE: as of Phase 2, this flag only gates settings validation — the
+    # prefill-path arbitration that would make it do anything is Phase 3.
+    chunk_kv_reuse_enabled: bool = False
+    chunk_kv_recompute_pct: Optional[float] = None  # None = default 0.15
+    chunk_kv_min_chunk_tokens: Optional[int] = None  # None = default 256
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
@@ -262,6 +301,19 @@ class ModelSettings:
                     'mtp_draft_depth must be between 1 and 8 or "auto", '
                     f"got {self.mtp_draft_depth}"
                 )
+        # N-gram speculation is one speculative path among several — exactly
+        # one may drive a model's decode loop.
+        if self.ngram_spec_enabled:
+            for name, value in (
+                ("mtp_enabled", self.mtp_enabled),
+                ("dflash_enabled", self.dflash_enabled),
+                ("vlm_mtp_enabled", self.vlm_mtp_enabled),
+            ):
+                if value:
+                    raise ValueError(
+                        f"ngram_spec_enabled and {name} cannot both be True; "
+                        "choose one speculative-decoding path per model"
+                    )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
         # or with TurboQuant (which mutates the same cache objects).
@@ -278,6 +330,29 @@ class ModelSettings:
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
                     )
+        # Chunk KV reuse is prefill-side (orthogonal to the decode-side
+        # speculative paths above) but shares no code with dflash's own
+        # engine/cache, and v1 cannot RoPE-shift TurboQuant's quantized KV
+        # without a dequant round-trip (see cacheblend_plan.md "Later").
+        if self.chunk_kv_reuse_enabled:
+            for name, value in (
+                ("dflash_enabled", self.dflash_enabled),
+                ("turboquant_kv_enabled", self.turboquant_kv_enabled),
+            ):
+                if value:
+                    raise ValueError(
+                        f"chunk_kv_reuse_enabled and {name} cannot both be True"
+                    )
+            if (
+                self.chunk_kv_recompute_pct is not None
+                and not (0.0 < self.chunk_kv_recompute_pct <= 1.0)
+            ):
+                raise ValueError("chunk_kv_recompute_pct must be in (0, 1]")
+            if (
+                self.chunk_kv_min_chunk_tokens is not None
+                and self.chunk_kv_min_chunk_tokens <= 0
+            ):
+                raise ValueError("chunk_kv_min_chunk_tokens must be positive")
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

@@ -300,10 +300,17 @@ class TestSchedulerSettings:
     """Tests for SchedulerSettings dataclass."""
 
     def test_defaults(self):
-        """Test default values."""
-        settings = SchedulerSettings()
+        """Test default values on a normal (>=24GB) system."""
+        with patch("omlx.settings.get_system_memory", return_value=64 * 1024**3):
+            settings = SchedulerSettings()
         assert settings.max_concurrent_requests == 8
         assert settings.embedding_batch_size == 32
+
+    def test_defaults_small_system(self):
+        """Test the RAM-aware default lowers max_concurrent_requests on <24GB systems."""
+        with patch("omlx.settings.get_system_memory", return_value=8 * 1024**3):
+            settings = SchedulerSettings()
+        assert settings.max_concurrent_requests == 4
 
     def test_custom_values(self):
         """Test custom values."""
@@ -315,7 +322,8 @@ class TestSchedulerSettings:
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        settings = SchedulerSettings()
+        with patch("omlx.settings.get_system_memory", return_value=64 * 1024**3):
+            settings = SchedulerSettings()
         result = settings.to_dict()
         assert result == {
             "max_concurrent_requests": 8,
@@ -756,7 +764,10 @@ class TestGlobalSettings:
 
     def test_defaults(self):
         """Test default values."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+        ):
             settings = GlobalSettings(base_path=Path(tmpdir))
             assert settings.server.host == "127.0.0.1"
             assert settings.server.port == 8000

@@ -1,35 +1,41 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Generic A/B performance benchmark CLI for a running oMLX server.
+"""General A/B performance benchmark CLI for a running oMLX server.
 
-Measures TTFT and decode throughput per workload scenario against a live
-server, optionally flipping a single admin model-setting off/on between
-passes so an optimization's real-world impact can be compared directly.
+Measures TTFT and decode throughput per workload scenario, plus feature stats
+from the admin API. Run once with a feature off and once with it on (or use
+--ab to flip a model setting automatically via the admin API and run both).
 
 Usage:
-    uv run python scripts/perf_bench.py --model <model-id>
-    uv run python scripts/perf_bench.py --model <model-id> \
-        --ab --setting-key ngram_spec_enabled
+    uv run python scripts/perf_bench.py --model <model-id>            # single pass
+    uv run python scripts/perf_bench.py --model <model-id> --ab       # off vs on
     uv run python scripts/perf_bench.py --model <model-id> --scenario code_edit
+    uv run python scripts/perf_bench.py --model <model-id> --ab \
+        --setting-key chunk_kv_reuse_enabled --stats-path admin/api/kv-reuse/stats
 
 Requires: a server started with `omlx serve` on --base-url (default
-http://localhost:8000) with admin auth disabled or --api-key set.
+http://localhost:8000) with admin auth disabled or --admin-token set.
 
 Scenarios (all temp=0 so runs are comparable and lossless):
-    summarize  — summarize a repetitive document (echo-heavy)
-    code_edit  — "rewrite this function with a small change" (echo-heavy)
-    rag        — answer with quotes from provided context (echo-heavy)
-    freeform   — open-ended prose (control; expects ~neutral result)
+    summarize      — summarize a repetitive document (echo-heavy)
+    code_edit      — "rewrite this function with a small change" (echo-heavy)
+    rag            — answer with quotes from provided context (echo-heavy)
+    freeform       — open-ended prose (control; expects ~neutral result)
+    rag_permuted   — same context chunks, reordered per run (non-prefix reuse)
+    agent_loop     — stable head + varying tail (simulated tool-output loop)
+    multi_turn_edit — conversation with an edited middle turn across runs
+    prefix_control — identical prompt every run (strict-prefix; expect ~0 gain)
 
-To adapt for a new optimization branch: pass --setting-key <your_flag> to
-toggle the relevant model setting via the admin API, and optionally
---stats-path <admin/api/...> to fetch/reset feature-specific stats between
-passes (printed as raw JSON alongside each scenario's results).
+Scenarios with multiple prompt variants (rag_permuted, agent_loop,
+multi_turn_edit) cycle through their variants across warmup+measured runs
+instead of repeating one fixed prompt, so the harness can exercise cache
+paths that a byte-identical repeat would never touch.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import statistics
 import sys
@@ -68,6 +74,83 @@ _CODE = '''def process_records(records, filters, transform=None):
         results.append(record)
     return results
 '''
+
+# Independent content blocks for the chunk-reuse scenarios below: each is
+# self-contained so it can be relocated to any position in a prompt without
+# reading oddly, which is what lets rag_permuted reorder them per run.
+_CHUNKS = {
+    "memory": "The scheduler admits requests while a memory guard watches "
+    "the unified memory ceiling. The memory guard throttles prefill when "
+    "the projected usage would exceed the ceiling.\n",
+    "cache": "The server implements a paged KV cache with an SSD spill "
+    "tier. The server implements a prefix cache so repeated prompts skip "
+    "prefill.\n",
+    "spec": "The server implements speculative decoding so generation can "
+    "emit several tokens per forward pass.\n",
+    "admin": "The admin dashboard exposes model settings, benchmarks and "
+    "download management for the server.\n",
+}
+
+_RAG_PERMUTED_ORDERS = [
+    ("memory", "cache", "spec", "admin"),
+    ("cache", "admin", "memory", "spec"),
+    ("spec", "memory", "admin", "cache"),
+]
+
+
+def _rag_permuted_variant(order):
+    context = "".join(_CHUNKS[name] for name in order)
+    return [
+        {
+            "role": "user",
+            "content": "Context:\n" + context + "\n\nUsing only the context "
+            "above, explain what the memory guard does. Quote the relevant "
+            "sentences verbatim in your answer.",
+        }
+    ]
+
+
+_AGENT_LOOP_HEAD = (
+    "You are an agent working through a multi-step task. Shared project "
+    "context:\n\n" + _DOC
+)
+_AGENT_LOOP_TAILS = [
+    "Tool output (step 1): file src/a.py changed, 12 lines added. "
+    "Summarize the change and suggest the next tool call.",
+    "Tool output (step 2): tests failed: 2 failures in test_cache.py. "
+    "Summarize the failures and suggest the next tool call.",
+    "Tool output (step 3): lint passed, 0 warnings. Summarize the status "
+    "and suggest the next tool call.",
+]
+
+
+def _agent_loop_variant(tail):
+    return [
+        {"role": "user", "content": _AGENT_LOOP_HEAD},
+        {"role": "assistant", "content": "Understood, I'll track progress across steps."},
+        {"role": "user", "content": tail},
+    ]
+
+
+_MULTI_TURN_HEAD = "Context:\n" + _DOC + "\n\nWhat does the prefix cache do?"
+_MULTI_TURN_MIDDLES = [
+    "The prefix cache skips prefill for repeated prompts by reusing "
+    "previously computed KV entries for a shared prefix.",
+    "It matches the new request's token prefix against cached blocks and "
+    "reuses their KV state instead of recomputing them.",
+    "Repeated prompt prefixes hit a cache of already-computed key/value "
+    "tensors, avoiding redundant prefill work.",
+]
+_MULTI_TURN_TAIL = "Now do the same for the memory guard, quoting verbatim."
+
+
+def _multi_turn_edit_variant(middle):
+    return [
+        {"role": "user", "content": _MULTI_TURN_HEAD},
+        {"role": "assistant", "content": middle},
+        {"role": "user", "content": _MULTI_TURN_TAIL},
+    ]
+
 
 SCENARIOS = {
     "summarize": {
@@ -114,7 +197,39 @@ SCENARIOS = {
         ],
         "max_tokens": 300,
     },
+    "rag_permuted": {
+        "variants": [_rag_permuted_variant(order) for order in _RAG_PERMUTED_ORDERS],
+        "max_tokens": 250,
+    },
+    "agent_loop": {
+        "variants": [_agent_loop_variant(tail) for tail in _AGENT_LOOP_TAILS],
+        "max_tokens": 200,
+    },
+    "multi_turn_edit": {
+        "variants": [
+            _multi_turn_edit_variant(middle) for middle in _MULTI_TURN_MIDDLES
+        ],
+        "max_tokens": 250,
+    },
+    "prefix_control": {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Summarize the following document in about ten "
+                "sentences, quoting key phrases verbatim where possible:\n\n"
+                + _DOC,
+            }
+        ],
+        "max_tokens": 300,
+    },
 }
+
+
+def _variants(scenario):
+    """Return the list of message-lists for a scenario (>=1 entries)."""
+    if "variants" in scenario:
+        return scenario["variants"]
+    return [scenario["messages"]]
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +283,12 @@ def _post_json(url, payload, token=None):
 # ---------------------------------------------------------------------------
 
 
-def run_streaming_completion(base_url, model, scenario, token=None):
+def run_streaming_completion(base_url, model, messages, max_tokens, token=None):
     """One streaming chat completion; returns (ttft_s, decode_s, n_tokens)."""
     payload = {
         "model": model,
-        "messages": scenario["messages"],
-        "max_tokens": scenario["max_tokens"],
+        "messages": messages,
+        "max_tokens": max_tokens,
         "temperature": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -212,12 +327,16 @@ def run_streaming_completion(base_url, model, scenario, token=None):
 
 def run_scenario(base_url, model, name, runs, warmup, token=None):
     scenario = SCENARIOS[name]
+    max_tokens = scenario["max_tokens"]
+    variant_cycle = itertools.cycle(_variants(scenario))
     for _ in range(warmup):
-        run_streaming_completion(base_url, model, scenario, token=token)
+        run_streaming_completion(
+            base_url, model, next(variant_cycle), max_tokens, token=token
+        )
     ttfts, rates, tokens = [], [], []
     for i in range(runs):
         ttft, decode_s, n = run_streaming_completion(
-            base_url, model, scenario, token=token
+            base_url, model, next(variant_cycle), max_tokens, token=token
         )
         ttfts.append(ttft)
         rates.append(n / decode_s)
@@ -234,10 +353,7 @@ def run_scenario(base_url, model, name, runs, warmup, token=None):
     }
 
 
-def fetch_admin_stats(base_url, stats_path, token=None, reset=False):
-    """Fetch feature-specific stats from an admin endpoint, if configured."""
-    if not stats_path:
-        return {}
+def fetch_stats(base_url, stats_path, token=None, reset=False):
     try:
         sep = "&" if "?" in stats_path else "?"
         suffix = f"{sep}reset=true" if reset else ""
@@ -255,7 +371,8 @@ def set_setting_value(base_url, model, setting_key, value, token=None):
         method="PUT",
         token=token,
     ) as resp:
-        return json.loads(resp.read())
+        result = json.loads(resp.read())
+    return result
 
 
 def set_setting_enabled(base_url, model, setting_key, enabled, token=None):
@@ -264,32 +381,52 @@ def set_setting_enabled(base_url, model, setting_key, enabled, token=None):
 
 
 def summarize_stats(stats):
+    """Best-effort human-readable summary; falls back to raw key=value pairs
+    for feature stats shapes this script doesn't know about (e.g. a future
+    chunk-KV-reuse stats endpoint)."""
     if not stats:
         return "(no stats)"
-    return ", ".join(f"{k}={v}" for k, v in stats.items())
+    if "proposed_tokens" in stats:
+        proposed = stats.get("proposed_tokens", 0)
+        accepted = stats.get("accepted_tokens", 0)
+        cycles = stats.get("cycles", 0)
+        plain = stats.get("plain_steps", 0)
+        rate = f"{accepted / proposed * 100:.1f}%" if proposed else "n/a"
+        total_steps = cycles + plain
+        emits = (
+            stats.get("init_emits", 0)
+            + stats.get("draft_emits", 0)
+            + stats.get("plain_emits", 0)
+        )
+        tpc = f"{emits / total_steps:.2f}" if total_steps else "n/a"
+        return (
+            f"cycles={cycles} plain={plain} accept={accepted}/{proposed} ({rate}) "
+            f"tokens/step={tpc}"
+        )
+    return " ".join(f"{k}={v}" for k, v in stats.items())
 
 
 def run_pass(base_url, model, scenarios, runs, warmup, stats_path, token=None):
     results = {}
     for name in scenarios:
         print(f"  scenario: {name}")
-        fetch_admin_stats(base_url, stats_path, token=token, reset=True)
+        fetch_stats(base_url, stats_path, token=token, reset=True)
         results[name] = run_scenario(
             base_url, model, name, runs, warmup, token=token
         )
-        results[name]["stats"] = fetch_admin_stats(base_url, stats_path, token=token)
+        results[name]["stats"] = fetch_stats(base_url, stats_path, token=token)
         print(f"    stats: {summarize_stats(results[name]['stats'])}")
     return results
 
 
 def print_comparison(off, on):
-    print(f"\n{'scenario':<12} {'off tok/s':>10} {'on tok/s':>10} {'speedup':>8} "
+    print(f"\n{'scenario':<16} {'off tok/s':>10} {'on tok/s':>10} {'speedup':>8} "
           f"{'ttft off':>9} {'ttft on':>9}")
     for name in off:
         o, n = off[name], on[name]
         speedup = n["decode_tok_s"] / o["decode_tok_s"]
         print(
-            f"{name:<12} {o['decode_tok_s']:>10.1f} {n['decode_tok_s']:>10.1f} "
+            f"{name:<16} {o['decode_tok_s']:>10.1f} {n['decode_tok_s']:>10.1f} "
             f"{speedup:>7.2f}x {o['ttft_ms']:>8.0f}ms {n['ttft_ms']:>8.0f}ms"
         )
 
@@ -318,8 +455,9 @@ def main():
     )
     ap.add_argument(
         "--setting-key",
-        default=None,
-        help="model settings key to toggle for --ab (e.g. ngram_spec_enabled)",
+        default="ngram_spec_enabled",
+        help="boolean model-settings field to flip with --ab "
+        "(default: ngram_spec_enabled)",
     )
     ap.add_argument(
         "--sweep-values",
@@ -331,15 +469,12 @@ def main():
     )
     ap.add_argument(
         "--stats-path",
-        default=None,
-        help="admin API path for feature stats, e.g. admin/api/ngram-spec/stats",
+        default="admin/api/ngram-spec/stats",
+        help="admin API path (relative to --base-url) returning feature stats "
+        "(default: admin/api/ngram-spec/stats)",
     )
     ap.add_argument("--json", action="store_true", help="emit raw JSON results")
     args = ap.parse_args()
-
-    if (args.ab or args.sweep_values) and not args.setting_key:
-        print("error: --ab/--sweep-values requires --setting-key", file=sys.stderr)
-        return 1
 
     scenarios = args.scenario or sorted(SCENARIOS)
     token = args.api_key
@@ -380,22 +515,28 @@ def main():
         print(f"== pass 1: {args.setting_key} OFF ==")
         set_setting_enabled(args.base_url, args.model, args.setting_key, False, token=token)
         time.sleep(2)
-        off = run_pass(args.base_url, args.model, scenarios, args.runs, args.warmup,
-                        args.stats_path, token)
+        off = run_pass(
+            args.base_url, args.model, scenarios, args.runs, args.warmup,
+            args.stats_path, token,
+        )
         print(f"\n== pass 2: {args.setting_key} ON ==")
         set_setting_enabled(args.base_url, args.model, args.setting_key, True, token=token)
         time.sleep(2)
-        on = run_pass(args.base_url, args.model, scenarios, args.runs, args.warmup,
-                       args.stats_path, token)
+        on = run_pass(
+            args.base_url, args.model, scenarios, args.runs, args.warmup,
+            args.stats_path, token,
+        )
         print_comparison(off, on)
         if args.json:
             print(json.dumps({"off": off, "on": on}, indent=2))
     else:
-        results = run_pass(args.base_url, args.model, scenarios, args.runs,
-                            args.warmup, args.stats_path, token)
+        results = run_pass(
+            args.base_url, args.model, scenarios, args.runs, args.warmup,
+            args.stats_path, token,
+        )
         for name, r in results.items():
             print(
-                f"{name:<12} ttft {r['ttft_ms']:.0f} ms, "
+                f"{name:<16} ttft {r['ttft_ms']:.0f} ms, "
                 f"{r['decode_tok_s']:.1f} tok/s | {summarize_stats(r['stats'])}"
             )
         if args.json:

@@ -807,3 +807,111 @@ class TestApplyChatTemplatePartialMode:
         # continue_final_message=True (not add_generation_prompt=True).
         assert count_kwargs["continue_final_message"] is True
         assert count_kwargs["add_generation_prompt"] is False
+
+
+class TestComputeMessageTokenOffsets:
+    """Chunk-KV reuse: message token offsets from incremental template
+    renders (see docs/experimental/cacheblend_plan.md, message-boundary
+    chunking)."""
+
+    class _OffsetsTokenizer:
+        """Concatenating template + char-level encode: rendered prefixes are
+        string prefixes of the full prompt, and encode is trivially
+        prefix-stable, so every boundary validates."""
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=False, **kwargs
+        ):
+            text = "".join(f"<{m['role']}>{m['content']}</>" for m in messages)
+            if add_generation_prompt:
+                text += "<assistant>"
+            return text
+
+        def encode(self, text):
+            return [ord(c) for c in text]
+
+    def _make_engine(self, tokenizer):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine.__new__(BatchedEngine)
+        engine._tokenizer = tokenizer
+        engine._enable_thinking = None
+        engine._model_settings = SimpleNamespace(chunk_kv_reuse_enabled=True)
+        return engine
+
+    def test_offsets_match_rendered_prefix_lengths(self):
+        tok = self._OffsetsTokenizer()
+        engine = self._make_engine(tok)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        prompt = tok.apply_chat_template(messages, add_generation_prompt=True)
+
+        offsets = engine._compute_message_token_offsets(messages, None, None, prompt)
+
+        expected = [
+            len(tok.encode(tok.apply_chat_template(messages[:i])))
+            for i in (1, 2)
+        ]
+        assert offsets == expected
+        # Each offset is a true token-prefix boundary of the full prompt.
+        full_ids = tok.encode(prompt)
+        for i, off in zip((1, 2), offsets):
+            assert full_ids[:off] == tok.encode(
+                tok.apply_chat_template(messages[:i])
+            )
+
+    def test_single_message_returns_none(self):
+        engine = self._make_engine(self._OffsetsTokenizer())
+        messages = [{"role": "user", "content": "hello"}]
+        prompt = self._OffsetsTokenizer().apply_chat_template(
+            messages, add_generation_prompt=True
+        )
+        assert engine._compute_message_token_offsets(messages, None, None, prompt) is None
+
+    def test_non_prefix_render_drops_boundaries(self):
+        class _RewritingTokenizer(self._OffsetsTokenizer):
+            """Template output depends on the message count, so a prefix
+            render is NOT a string prefix of the full prompt — every
+            boundary must be dropped rather than misaligned."""
+
+            def apply_chat_template(
+                self, messages, tokenize=False, add_generation_prompt=False, **kwargs
+            ):
+                return f"[n={len(messages)}]" + super().apply_chat_template(
+                    messages, add_generation_prompt=add_generation_prompt
+                )
+
+        tok = _RewritingTokenizer()
+        engine = self._make_engine(tok)
+        messages = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+        ]
+        prompt = tok.apply_chat_template(messages, add_generation_prompt=True)
+        assert engine._compute_message_token_offsets(messages, None, None, prompt) is None
+
+    def test_tokenizer_errors_return_none(self):
+        class _BrokenTokenizer(self._OffsetsTokenizer):
+            def encode(self, text):
+                raise RuntimeError("boom")
+
+        tok = _BrokenTokenizer()
+        engine = self._make_engine(tok)
+        messages = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+        ]
+        assert (
+            engine._compute_message_token_offsets(messages, None, None, "xyz") is None
+        )
+
+    def test_chunk_kv_reuse_enabled_flag(self):
+        engine = self._make_engine(self._OffsetsTokenizer())
+        assert engine._chunk_kv_reuse_enabled() is True
+        engine._model_settings = SimpleNamespace(chunk_kv_reuse_enabled=False)
+        assert engine._chunk_kv_reuse_enabled() is False
+        engine._model_settings = None
+        assert engine._chunk_kv_reuse_enabled() is False
