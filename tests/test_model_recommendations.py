@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from omlx.admin.recommendations import (
     RecommendationContext,
+    best_estimated_gain,
     build_recommendations,
     collect_settings_payload,
 )
@@ -256,6 +257,142 @@ class TestCollectSettingsPayload:
         payload, ids = collect_settings_payload(recs)
         assert payload == {}
         assert ids == []
+
+
+class TestEstimatedGain:
+    def test_mtp_enable_gets_heuristic_high(self):
+        recs = build_recommendations(RecommendationContext(mtp_compatible=True))
+        rec = next(r for r in recs if r["id"] == "mtp-enable")
+        assert rec["estimated_gain"] == {"class": "high", "basis": "heuristic"}
+
+    def test_dflash_candidate_gets_heuristic_medium(self):
+        recs = build_recommendations(RecommendationContext(dflash_compatible=True))
+        rec = next(r for r in recs if r["id"] == "dflash-candidate")
+        assert rec["estimated_gain"] == {"class": "medium", "basis": "heuristic"}
+
+    def test_quantized_head_warning_has_no_estimate(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True, mtp_enabled=True, mtp_head_quantized=True
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-quantized-head")
+        assert "estimated_gain" not in rec
+
+    def test_use_auto_measured_gain_matches_tune_store(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth=1,
+                mtp_tuned_depth=2,
+                mtp_tune_entry=_TUNE_ENTRY,
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-use-auto")
+        assert rec["estimated_gain"] == {"measured": 30.0}
+
+    def test_use_auto_without_measurement_has_no_estimate(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth=1,
+                mtp_tuned_depth=2,
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-use-auto")
+        assert "estimated_gain" not in rec
+
+    def test_best_estimated_gain_prefers_measured_over_heuristic(self):
+        # Built by hand: the rule engine's mutually-exclusive conditions mean
+        # a measured rec and a heuristic rec never fire together in practice,
+        # but best_estimated_gain must still rank measured first if they did.
+        recs = [
+            {"id": "dflash-candidate", "title": "DFlash available",
+             "estimated_gain": {"class": "medium", "basis": "heuristic"}},
+            {"id": "mtp-use-auto", "title": "Use tuned depth",
+             "estimated_gain": {"measured": 30.0}},
+        ]
+        best = best_estimated_gain(recs)
+        assert best["id"] == "mtp-use-auto"
+        assert best["estimated_gain"] == {"measured": 30.0}
+
+    def test_best_estimated_gain_none_when_nothing_estimated(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True, mtp_enabled=True, mtp_head_quantized=True
+            )
+        )
+        assert best_estimated_gain(recs) is None
+
+    def test_best_estimated_gain_empty_list(self):
+        assert best_estimated_gain([]) is None
+
+
+class TestAbTrialMeasured:
+    """P2b: stored A/B trial results upgrade heuristic recs to measured."""
+
+    _entry = {
+        "settings_hash": "h",
+        "gain_pct": 43.0,
+        "variants": {
+            "current": {"tps_median": 41.2, "samples": [40.8, 41.6]},
+            "candidate": {"tps_median": 58.9, "samples": [58.1, 59.7]},
+        },
+        "trial_at": "2026-07-11T10:00:00",
+    }
+
+    def test_trial_result_attaches_measured(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                ab_trial_results={"mtp-enable": self._entry},
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-enable")
+        assert rec["measured"]["gain_pct"] == 43.0
+        assert rec["measured"]["source"] == "ab_trial"
+        assert rec["measured"]["baseline_tps"] == 41.2
+        assert rec["measured"]["candidate_tps"] == 58.9
+        assert rec["estimated_gain"] == {"measured": 43.0}
+
+    def test_tune_store_measurement_wins_over_trial(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth=1,
+                mtp_tuned_depth=2,
+                mtp_tune_entry={
+                    "depth": 2,
+                    "tps_by_depth": {"0": 10.0, "2": 13.0},
+                },
+                ab_trial_results={"mtp-use-auto": self._entry},
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-use-auto")
+        assert rec["measured"].get("source") != "ab_trial"
+        assert rec["measured"]["winner_depth"] == 2
+
+    def test_trial_without_gain_is_ignored(self):
+        entry = {**self._entry, "gain_pct": None}
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                ab_trial_results={"mtp-enable": entry},
+            )
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-enable")
+        assert "measured" not in rec
+        assert rec["estimated_gain"]["basis"] == "heuristic"
+
+    def test_no_results_means_no_change(self):
+        recs = build_recommendations(
+            RecommendationContext(mtp_compatible=True, ab_trial_results={})
+        )
+        rec = next(r for r in recs if r["id"] == "mtp-enable")
+        assert "measured" not in rec
 
 
 class TestOrderingAndEmpty:

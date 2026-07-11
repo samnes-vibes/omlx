@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -525,16 +526,53 @@ def _maybe_disable_low_acceptance_mtp(model: Any, stats: "_MtpStats") -> bool:
         if quantized
         else ""
     )
-    logger.warning(
-        "MTP acceptance %.1f%% over %d drafted positions is below the %.0f%% "
-        "floor; disabling MTP for this model and falling back to standard "
-        "decode.%s",
-        rate * 100,
-        stats.draft_tokens,
-        _MTP_ACCEPT_FLOOR * 100,
-        cause,
+    reason = (
+        f"MTP acceptance {rate * 100:.1f}% over {stats.draft_tokens} drafted "
+        f"positions is below the {_MTP_ACCEPT_FLOOR * 100:.0f}% floor; "
+        f"disabling MTP for this model and falling back to standard decode."
+        f"{cause}"
     )
+    disabled_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for candidate in candidates:
+        if hasattr(candidate, "_omlx_mtp_decode_enabled"):
+            candidate._omlx_mtp_auto_disabled_reason = reason
+            candidate._omlx_mtp_auto_disabled_at = disabled_at
+    logger.warning(reason)
     return True
+
+
+def mtp_runtime_status(model: Any) -> Optional[Dict[str, Any]]:
+    """Live per-instance MTP decode state, for the admin capabilities endpoint.
+
+    Returns ``None`` when *model* was never stamped with MTP markers (no
+    MTP head attached at load time). Otherwise reports whether the decode
+    path is currently active, the effective draft depth (post depth-1
+    clamp, see :func:`_mtp_draft_depth`), and — when the runtime
+    acceptance-floor guard has tripped — why and when. The guard is sticky
+    for the life of the loaded instance, so ``auto_disabled`` implies
+    ``decode_active`` is False.
+    """
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    if not any(hasattr(c, "_omlx_mtp_decode_enabled") for c in candidates):
+        return None
+    decode_active = _model_mtp_decode_enabled(model)
+    reason = None
+    disabled_at = None
+    for c in candidates:
+        reason = reason or getattr(c, "_omlx_mtp_auto_disabled_reason", None)
+        disabled_at = disabled_at or getattr(c, "_omlx_mtp_auto_disabled_at", None)
+    auto_disabled = bool(reason) and not decode_active
+    return {
+        "decode_active": decode_active,
+        "effective_depth": _mtp_draft_depth(model),
+        "auto_disabled": auto_disabled,
+        "auto_disabled_reason": reason if auto_disabled else None,
+        "auto_disabled_at": disabled_at if auto_disabled else None,
+    }
 
 
 @dataclass

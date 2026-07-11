@@ -83,6 +83,75 @@ class TestMtpCapability:
         assert cap["reason"] == "paroquant model"
 
 
+class TestMtpLiveStatus:
+    """Phase 5: runtime status surfaced when MTP is enabled."""
+
+    def test_no_live_block_when_not_enabled(self):
+        cap = _cap(build_capabilities(_mtp_ready()), "mtp")
+        assert "live" not in cap
+
+    def test_not_loaded_yet(self):
+        ctx = _mtp_ready(mtp_enabled=True, mtp_runtime=None)
+        cap = _cap(build_capabilities(ctx), "mtp")
+        assert cap["live"]["loaded"] is False
+        assert cap["live"]["auto_disabled"] is False
+
+    def test_loaded_and_healthy_reports_depth(self):
+        ctx = _mtp_ready(
+            mtp_enabled=True,
+            mtp_runtime={
+                "decode_active": True,
+                "effective_depth": 3,
+                "auto_disabled": False,
+                "auto_disabled_reason": None,
+                "auto_disabled_at": None,
+            },
+            mtp_tuned_winner_depth=3,
+            mtp_tuned_at="2026-07-11T10:00:00",
+        )
+        cap = _cap(build_capabilities(ctx), "mtp")
+        live = cap["live"]
+        assert live["loaded"] is True
+        assert live["decode_active"] is True
+        assert live["effective_depth"] == 3
+        assert live["auto_disabled"] is False
+        assert live["tuned_winner_depth"] == 3
+        assert live["tuned_at"] == "2026-07-11T10:00:00"
+
+    def test_auto_disabled_surfaces_reason(self):
+        ctx = _mtp_ready(
+            mtp_enabled=True,
+            mtp_runtime={
+                "decode_active": False,
+                "effective_depth": 1,
+                "auto_disabled": True,
+                "auto_disabled_reason": "MTP acceptance 8.0% ... below the 15% floor",
+                "auto_disabled_at": "2026-07-11T09:00:00",
+            },
+        )
+        cap = _cap(build_capabilities(ctx), "mtp")
+        live = cap["live"]
+        assert live["auto_disabled"] is True
+        assert "floor" in live["auto_disabled_reason"]
+        assert live["auto_disabled_at"] == "2026-07-11T09:00:00"
+
+    def test_quantized_head_active_also_carries_live_block(self):
+        ctx = _mtp_ready(
+            mtp_head_quantized=True,
+            mtp_enabled=True,
+            mtp_runtime={
+                "decode_active": False,
+                "effective_depth": 1,
+                "auto_disabled": True,
+                "auto_disabled_reason": "collapsed acceptance",
+                "auto_disabled_at": "2026-07-11T09:00:00",
+            },
+        )
+        cap = _cap(build_capabilities(ctx), "mtp")
+        assert cap["status"] == "active"
+        assert cap["live"]["auto_disabled"] is True
+
+
 class TestDflashCapability:
     def test_unsupported_arch(self):
         ctx = CapabilityContext(dflash_supported=False, dflash_reason="nope")

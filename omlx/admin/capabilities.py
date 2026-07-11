@@ -64,6 +64,12 @@ class CapabilityContext:
     specprefill_enabled: bool = False
     specprefill_draft_model: str | None = None
     turboquant_kv_enabled: bool = False
+    # Live runtime state (Phase 5), only populated when the model is
+    # loaded — None fields mean "not loaded" / "not applicable" rather
+    # than a specific value.
+    mtp_runtime: dict | None = None
+    mtp_tuned_winner_depth: int | None = None
+    mtp_tuned_at: str | None = None
 
 
 def _cap(feature: str, label: str, status: str, reason: str, catalog=None) -> dict:
@@ -73,6 +79,26 @@ def _cap(feature: str, label: str, status: str, reason: str, catalog=None) -> di
         "status": status,
         "reason": reason,
         "catalog": catalog,
+    }
+
+
+def _mtp_live_block(ctx: CapabilityContext) -> dict:
+    """Effective runtime state for the MTP row (Phase 5).
+
+    ``mtp_runtime`` is None when the model isn't currently loaded — the
+    settings say MTP is enabled, but nothing has run yet on this engine
+    instance, so there's no decode/depth/guard state to report.
+    """
+    runtime = ctx.mtp_runtime or {}
+    return {
+        "loaded": ctx.mtp_runtime is not None,
+        "decode_active": runtime.get("decode_active"),
+        "effective_depth": runtime.get("effective_depth"),
+        "auto_disabled": runtime.get("auto_disabled", False),
+        "auto_disabled_reason": runtime.get("auto_disabled_reason"),
+        "auto_disabled_at": runtime.get("auto_disabled_at"),
+        "tuned_winner_depth": ctx.mtp_tuned_winner_depth,
+        "tuned_at": ctx.mtp_tuned_at,
     }
 
 
@@ -112,7 +138,7 @@ def _mtp_capability(ctx: CapabilityContext) -> dict:
             catalog=mtp_architecture_notes(),
         )
     if ctx.mtp_head_quantized:
-        return _cap(
+        cap = _cap(
             "mtp",
             label,
             "needs-different-checkpoint" if not ctx.mtp_enabled else "active",
@@ -122,8 +148,13 @@ def _mtp_capability(ctx: CapabilityContext) -> dict:
             "checkpoint with a BF16 MTP head.",
             catalog=mtp_architecture_notes(),
         )
+        if ctx.mtp_enabled:
+            cap["live"] = _mtp_live_block(ctx)
+        return cap
     if ctx.mtp_enabled:
-        return _cap("mtp", label, "active", "Enabled; draft+verify in use.")
+        cap = _cap("mtp", label, "active", "Enabled; draft+verify in use.")
+        cap["live"] = _mtp_live_block(ctx)
+        return cap
     return _cap(
         "mtp",
         label,

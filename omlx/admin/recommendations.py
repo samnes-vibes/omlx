@@ -30,6 +30,15 @@ from typing import Any
 
 _SEVERITY_ORDER = {"warn": 0, "suggest": 1, "info": 2}
 
+# Phase 6: rough benefit class for rules with no measured tune-store number
+# to quote yet. Deliberately coarse (no invented percentages) — only rules
+# whose action plausibly moves decode speed get a class at all.
+_HEURISTIC_GAIN = {
+    "mtp-enable": "high",
+    "dflash-candidate": "medium",
+}
+_GAIN_CLASS_RANK = {"high": 0, "medium": 1, "low": 2}
+
 
 @dataclass
 class RecommendationContext:
@@ -50,6 +59,10 @@ class RecommendationContext:
     # Full tune-store entry ({"depth", "tps_by_depth", "tuned_at"}) when
     # available — lets measured rules quote numbers, not just the winner.
     mtp_tune_entry: dict | None = None
+    # P2b: completed A/B trial results for the model's *current* settings
+    # (hash-filtered by the endpoint), keyed by rec id. Shape per entry:
+    # {"gain_pct", "variants", "trial_at", "settings_hash", ...}.
+    ab_trial_results: dict[str, dict] | None = None
 
 
 def _any_speculative_on(ctx: RecommendationContext) -> bool:
@@ -90,6 +103,80 @@ def _tune_measurement(ctx: RecommendationContext) -> dict | None:
             (tps_by_depth[winner] - baseline) / baseline * 100, 1
         )
     return measured
+
+
+def _attach_ab_trial_measurement(rec: dict, ctx: RecommendationContext) -> None:
+    """P2b: back a rec with its stored A/B trial result, when one exists.
+
+    Tune-store measurements (already on ``measured``) win — they carry the
+    richer per-depth table. Only trials with a computable ``gain_pct``
+    upgrade the rec; a half-failed trial stays invisible.
+    """
+    if rec.get("measured"):
+        return
+    entry = (ctx.ab_trial_results or {}).get(rec["id"])
+    if not isinstance(entry, dict) or entry.get("gain_pct") is None:
+        return
+    measured: dict = {
+        "gain_pct": float(entry["gain_pct"]),
+        "source": "ab_trial",
+    }
+    variants = entry.get("variants")
+    if isinstance(variants, dict):
+        cur = (variants.get("current") or {}).get("tps_median")
+        cand = (variants.get("candidate") or {}).get("tps_median")
+        if cur is not None:
+            measured["baseline_tps"] = cur
+        if cand is not None:
+            measured["candidate_tps"] = cand
+    if entry.get("trial_at"):
+        measured["trial_at"] = entry["trial_at"]
+    rec["measured"] = measured
+
+
+def _attach_estimated_gain(rec: dict) -> None:
+    """P6: tag ``rec`` with ``estimated_gain`` — measured beats heuristic.
+
+    Measured numbers come from the tune store (already on ``measured.
+    gain_pct`` when present). Everything else gets a class from
+    ``_HEURISTIC_GAIN``, or no estimate at all (advice-only rules like the
+    quantized-head warning, or the tune rule itself before it has run).
+    """
+    measured = rec.get("measured")
+    if measured and "gain_pct" in measured:
+        rec["estimated_gain"] = {"measured": measured["gain_pct"]}
+        return
+    cls = _HEURISTIC_GAIN.get(rec["id"])
+    if cls:
+        rec["estimated_gain"] = {"class": cls, "basis": "heuristic"}
+
+
+def _gain_sort_key(rec: dict) -> tuple[int, float]:
+    """Lower sorts first: measured (by descending %) > heuristic class > none."""
+    gain = rec.get("estimated_gain")
+    if not gain:
+        return (2, 0.0)
+    if "measured" in gain:
+        return (0, -float(gain["measured"]))
+    return (1, float(_GAIN_CLASS_RANK.get(gain.get("class"), 3)))
+
+
+def best_estimated_gain(recs: list[dict]) -> dict | None:
+    """Pick the single biggest-estimated-gain recommendation (P6 heading).
+
+    Used for the panel's "Biggest estimated gain: ..." summary; returns
+    None when nothing carries an estimate. Measured numbers always outrank
+    heuristic classes.
+    """
+    candidates = [r for r in recs if r.get("estimated_gain")]
+    if not candidates:
+        return None
+    best = min(candidates, key=_gain_sort_key)
+    return {
+        "id": best["id"],
+        "title": best["title"],
+        "estimated_gain": best["estimated_gain"],
+    }
 
 
 def build_recommendations(ctx: RecommendationContext) -> list[dict]:
@@ -240,7 +327,13 @@ def build_recommendations(ctx: RecommendationContext) -> list[dict]:
             }
         )
 
-    recs.sort(key=lambda r: _SEVERITY_ORDER.get(r["severity"], 9))
+    for rec in recs:
+        _attach_ab_trial_measurement(rec, ctx)
+        _attach_estimated_gain(rec)
+
+    recs.sort(
+        key=lambda r: (_SEVERITY_ORDER.get(r["severity"], 9), _gain_sort_key(r))
+    )
     return recs
 
 

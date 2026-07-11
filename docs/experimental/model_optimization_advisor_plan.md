@@ -4,9 +4,12 @@ Date: 2026-07-10
 Branch: `feat/mtp-multi-depth`
 Status: **Phase 1 implemented** (2026-07-10); **Phase 2a (measured
 tune-store recommendations) and Phase 3 (apply-as-profile) implemented**
-(2026-07-11) — see implementation notes at the end. Phase 2b (A/B trials
-+ SSE) not started. **Phase 4 (capability matrix) implemented**
-(2026-07-11); Phases 5–6 proposed (gap review 2026-07-11).
+(2026-07-11) — see implementation notes at the end. **Phase 4 (capability
+matrix) implemented** (2026-07-11); **Phase 5 (live MTP automation
+status) implemented** (2026-07-11); **Phase 6 (benefit ordering)
+implemented** (2026-07-11). **Phase 2b (generic A/B trial engine) and
+Phase 7 (guided wizard flow) implemented** (2026-07-11) — see the design
+sections below and the implementation notes at the end.
 Companion to: [mtplx_adoption_plan.md](mtplx_adoption_plan.md) (the MTP
 auto-tune endpoint this surfaces), [5x_speedup_research.md](5x_speedup_research.md)
 
@@ -84,10 +87,11 @@ vs depth 0, `tuned_at`) attached to `mtp-use-auto`, plus a new
 already `"auto"` and the tuned winner is > 0. The UI renders the
 depth×tps row (winner bolded) under any recommendation with `measured`.
 
-**2b (not started):** DFlash A/B trials (perf_bench-style, driven through
-the engine like `mtp_tune.py`) so "suggest" items can be upgraded to
-measured claims. Requires a background-run pattern (SSE progress like the
-benchmark tab) once trials take minutes.
+**2b (implemented 2026-07-11, design below):** generic A/B trials — not DFlash-only —
+so any "suggest" recommendation can be upgraded to a measured claim before
+the operator applies it. Requires a background-run pattern (SSE progress
+like the benchmark tab) once trials take minutes. See detailed design
+under [Phase 2b](#phase-2b--generic-ab-trial-engine-detailed-design-proposed).
 
 ### Phase 3 — apply-as-profile (implemented 2026-07-11)
 
@@ -214,6 +218,320 @@ principle as Phase 2a).
 Proposed order: **Phase 4 first** (removes the biggest source of confusion
 and produces the structures 5–6 use), then 5 (cheap, mostly surfacing
 existing state), then 6 (depends on measurement data accumulating).
+
+## Phase 2b — generic A/B trial engine: detailed design (proposed)
+
+### Problem
+
+Two measurement mechanisms exist today and don't talk to each other:
+
+- `omlx/admin/mtp_tune.py` + `POST /admin/api/models/{id}/mtp-tune`:
+  **synchronous** — the request blocks for the whole round-robin sweep
+  (depths 0..4, 2 repeats, 128 tokens/trial ⇒ tens of seconds). Good
+  measurement discipline (round-robin against thermal drift, restores the
+  model's stamps in a `finally`), but no progress reporting and hard-coded
+  to one axis (MTP draft depth).
+- `omlx/admin/benchmark.py` + `POST /api/bench/start` /
+  `GET /api/bench/{id}/stream`: **background task + SSE**
+  (`BenchmarkRun` dataclass, append-only `events` log, `asyncio.Condition`
+  for replay-then-wait subscribers, single-run guard via
+  `get_active_run()`). Good delivery model, but only measures raw
+  prompt-length/batch-size throughput — it has no concept of "setting A
+  vs. setting B".
+
+Neither can answer "would enabling DFlash actually help *this* model on
+*this* machine, before I commit to it" — the recommendations panel can
+only assert `mtp-use-auto`/`mtp-tuned-optimal` claims today because those
+piggyback on the MTP tuner; every other "suggest" rule (`mtp-enable`,
+`dflash-candidate`, and the Phase-4-gap rules for `specprefill_enabled`,
+`turboquant_kv_enabled`, `dflash_draft_quant_*`, `dflash_verify_mode`) is
+heuristic-only forever unless something can run the comparison.
+
+### Approach
+
+Take `mtp_tune.py`'s measurement discipline (round-robin, restore original
+state in `finally`, warmup trial, median-of-repeats, `tps_by_depth`-style
+data) and `benchmark.py`'s delivery model (background task, `Run`
+dataclass with SSE `events`, single-run guard), and generalize the *axis*
+being swept from "MTP draft depth" to "arbitrary settings dict".
+
+1. **`omlx/admin/ab_trial.py`** (new): `ABTrialRun` dataclass, same shape
+   as `BenchmarkRun` (`trial_id`, `status`, `events`, `cond`, `terminal`,
+   `task`) plus:
+   ```python
+   variants: list[dict]   # e.g. [{"label": "current", "settings": {...}},
+                           #       {"label": "candidate", "settings": {...}}]
+   prompt: str = _DEFAULT_PROMPT   # reuse mtp_tune._PROMPT by default
+   repeats: int = 2
+   max_tokens: int = 128
+   results: dict[str, list[float]] = {}   # label -> tps samples
+   ```
+   `run_ab_trial(run, engine_pool)`: for each repeat, round-robin over
+   `variants`, apply that variant's settings to the *live* engine instance
+   the same way `mtp_tune._set_trial_depth` stamps per-instance markers
+   for MTP — for settings that aren't stampable on a live instance (e.g.
+   `dflash_enabled`, `turboquant_kv_enabled`, which are read at model-load
+   time, not per-request), fall back to **reloading the model** between
+   variants via the existing settings-apply + engine-pool reload path.
+   This makes trials involving those settings much more expensive (model
+   reload, ~seconds–tens of seconds each) than a pure MTP-depth sweep —
+   the UI must show this cost estimate before the operator confirms (see
+   Phase 7 below), and the endpoint should refuse >2 variants when any
+   settings key requires a reload, to keep worst-case bounded.
+   Emits `progress` events per (repeat, variant) like the benchmark tab,
+   a final `result` event with `{variant_label: {tps_median, samples}}`
+   plus `gain_pct` between the two variants, and restores original
+   settings/stamps in `finally` regardless of outcome.
+2. **Endpoint** `POST /admin/api/models/{id}/recommendations/{rec_id}/ab-trial`:
+   looks up the recommendation by id (re-runs `_build_recommendations_for`
+   server-side so the payload can't be spoofed), builds `variants` as
+   `[{"label": "current", "settings": <settings.model_dump()>},
+     {"label": "candidate", "settings": <current + collect_settings_payload([rec])>}]`,
+   creates an `ABTrialRun`, starts it as an `asyncio.create_task` (mirrors
+   `start_benchmark`), returns `{"trial_id": ...}`. Rejects 409 if another
+   trial *or* a throughput benchmark is running on this model (shared
+   `get_active_run()`-style guard — both stress the same engine instance).
+3. **Stream** `GET /admin/api/models/{id}/ab-trial/{trial_id}/stream`:
+   same SSE shape as `/bench/{id}/stream` (replay `events` from offset 0,
+   then wait on `cond`), so the frontend can reuse `connectBenchSSE`'s
+   parsing logic with a different URL rather than writing a second SSE
+   client.
+4. **Recommendation payload**: once a trial completes, its `gain_pct`
+   is written back onto the recommendation's `measured` field the next
+   time `build_recommendations` runs for this model — i.e. persist trial
+   results the same way `mtp_tune.py` persists to `mtp_tune.json`, keyed
+   by `(model, hardware_id, rec_id, settings_hash)` so a stale trial
+   result doesn't silently get reused after the operator changes
+   something else. New store: `ab_trials.json`, same
+   read/write pattern as `mtp_tune.tune_store_path`.
+
+### Data shape (SSE `result` event)
+
+```json
+{
+  "type": "result",
+  "rec_id": "dflash-candidate",
+  "variants": {
+    "current":   {"tps_median": 41.2, "samples": [40.8, 41.6]},
+    "candidate": {"tps_median": 58.9, "samples": [58.1, 59.7]}
+  },
+  "gain_pct": 43.0,
+  "reload_required": true,
+  "elapsed_s": 34.1
+}
+```
+
+### Out of scope (2b)
+
+- Trials that need a *choice* first (DFlash draft model, VLM drafter
+  checkpoint) — the operator must resolve `needs-config` (Phase 4) before
+  a candidate settings dict even exists to trial.
+- Multi-variant sweeps beyond current-vs-candidate (MTP depth sweeps stay
+  on the existing `mtp-tune` endpoint; this is specifically for the
+  advisor's binary "should I flip this?" case).
+- Accuracy/quality regression checks — this measures throughput only,
+  same as `mtp_tune.py` and the benchmark tab today.
+
+## Phase 7 — guided wizard flow (proposed)
+
+### Problem
+
+The settings modal today is flat and toggle-first: Profiles row →
+Basic settings → Advanced settings → Experimental section, where the
+Experimental section itself stacks three independent information sources
+(capability matrix, recommendations panel, then five separate toggle
+cards for TurboQuant KV / IndexCache / SpecPrefill / DFlash / MTP / VLM
+MTP). An operator who wants "just tell me what to turn on" has to read
+the capability badge, cross-reference the recommendation card, then
+scroll to the matching toggle card to actually apply anything that isn't
+a single-key settings PUT (e.g. picking a DFlash draft model). Nothing
+walks them through it in order, and nothing offers to *prove* a
+recommendation before committing to it.
+
+### Approach
+
+Not a replacement UI — an **optional guided rail overlaid on the existing
+recommendations panel**, so the toggle cards keep working for manual
+fine-tuning and the wizard doesn't become a second UI to maintain
+alongside them (this is a third-party-maintained fork per `CLAUDE.md`;
+minimize surface that diverges from upstream's modal structure).
+
+1. **Entry point**: a "Guide me" button next to the existing
+   "Apply all" button in the recommendations panel header (only shown
+   when `modelRecs.length > 0`). Opens a step sequence *within* the same
+   modal (Alpine `x-show` step index), not a separate modal, reusing
+   `modelRecs` — no new data fetch.
+2. **Step sequence** (one recommendation at a time, in the existing
+   severity → estimated-gain order from Phase 6 — so the wizard visits
+   `warn` items first, and within a tier the biggest `estimated_gain`
+   first):
+   - **Explain**: title + detail (already have this) + capability-matrix
+     cross-reference when the rec's feature is `needs-config` (link to
+     the relevant toggle card instead of a bare Apply button — Phase 4's
+     catalog data answers "what do I need to load/pick" right here
+     instead of the operator discovering it three cards down).
+   - **Optional compare**: when the rec's action is a `settings` PUT *and*
+     the model isn't already mid-benchmark, show a secondary "Compare
+     before/after (~30s)" button that calls the Phase 2b `ab-trial`
+     endpoint and streams progress inline (reuse `connectBenchSSE`'s SSE
+     parsing against the new stream URL). Skippable — default path is
+     still direct Apply, matching the existing one-click principle
+     (Phase 3's non-goal: nothing applies without an explicit click, and
+     the *comparison* is opt-in on top of that, not a forced gate).
+   - **Decide**: Apply (single-key PUT, same call as today) / Skip / Undo
+     if a trial's candidate variant was left active (trials should leave
+     the model on the "current" variant when they finish per Phase 2b's
+     `finally`-restore — Undo here is a safety net, not the primary path).
+   - Advance to the next recommendation; **Finish** step shows a summary
+     (applied / skipped / measured-gain list) and offers "Apply all
+     remaining" (existing endpoint) as an escape hatch for anyone who
+     stops reading partway through.
+3. **State**: purely client-side (`wizardStep`, `wizardRecIndex`) — no new
+   backend state beyond what Phase 2b introduces; `modelRecs` is reloaded
+   after each Apply exactly like `applyRecommendation()` does today, so
+   the wizard and the flat panel never disagree about what's left.
+4. **First-run nudge (optional, cheap)**: when a model's settings modal
+   is opened for the first time and `modelRecs` contains at least one
+   `warn`/`suggest`, auto-suggest the "Guide me" button with a one-time
+   highlight (localStorage flag per `model_id`, not a server-side
+   first-run concept) instead of a forced wizard — respects the
+   non-goal that nothing happens without a click.
+
+### Sequencing dependency
+
+Phase 7's "optional compare" step is inert without Phase 2b (the button
+would have nothing to call), so **2b ships first**; Phase 7 is UI-only
+once the trial endpoint exists, and degrades gracefully (compare button
+hidden) if 2b isn't done yet — i.e. Phase 7 can start once Phase 4 exists
+(for the "needs-config" cross-reference) even before 2b lands, with the
+compare step arriving as a follow-up.
+
+### Out of scope (7)
+
+- A separate onboarding modal for *new installs* (this is per-model,
+  triggered from the existing settings modal, not a first-launch tour).
+- Reordering or removing the flat toggle cards — they stay as the manual
+  fine-tuning path.
+- Wizard support for recommendations with no `action` (advice-only rows
+  like `mtp-quantized-head`) beyond just displaying them in the Explain
+  step — there's nothing to Apply or Compare there.
+
+## Phase 2b + Phase 7 implementation notes (2026-07-11)
+
+Implemented per the designs above, with these deviations/decisions:
+
+- **`omlx/admin/ab_trial.py`**: as designed (`ABTrialRun`, round-robin
+  runner, `ab_trials.json` store keyed by (model, hardware, rec_id,
+  settings_hash)). The stampable set is just `mtp_draft_depth` (and only
+  while `mtp_enabled` is already on — the head must be attached); every
+  other key goes through the engine pool's **existing transient
+  `runtime_settings` variant mechanism** (`get_engine(...,
+  runtime_settings=candidate)`), which reloads per variant switch without
+  mutating persisted settings — no new reload plumbing was needed, and the
+  `finally` restore is just one more `get_engine()` with persisted
+  settings. `"auto"` depth in a variant resolves through
+  `load_tuned_depth`. A fresh candidate load gets its own 16-token warmup
+  so shader compile doesn't bill the first sample.
+- **Endpoints** in `routes.py`: `POST .../recommendations/{rec_id}/ab-trial`
+  (re-runs the rule engine server-side; 404 unknown rec, 400 actionless
+  rec, 409 when another trial *or* throughput bench is running) and
+  `GET .../ab-trial/{trial_id}/stream` (same replay-then-attach SSE loop
+  as the bench stream). Trial results feed back via a new
+  `RecommendationContext.ab_trial_results` (hash-filtered by the endpoint
+  with `load_trial_results`); `_attach_ab_trial_measurement` upgrades a
+  rec to `measured: {gain_pct, baseline_tps, candidate_tps, trial_at,
+  source: "ab_trial"}` — tune-store measurements win when both exist, and
+  the Phase 6 gain pill picks the number up unchanged.
+- **Wizard (P7)**, UI-only as designed: "Guide me" button in the
+  recommendations panel header opens an inline step card (Alpine state,
+  no new fetch). It walks a **snapshot** of `modelRecs` taken at start,
+  so the flat panel reloading after each Apply never shifts step order.
+  Steps: explain (severity badge + title + gain pill + detail) →
+  optional "Compare before/after" (starts the 2b trial, streams progress
+  via a second `EventSource`, shows current/candidate tok/s + gain) →
+  Apply / Skip. Advice-only rows show a "Next" button; the `mtp_tune`
+  action runs the existing tuner. Finish step summarizes
+  applied/skipped and offers "Apply all remaining" (existing P3
+  endpoint). First-run nudge = amber ring on "Guide me" via a
+  per-model localStorage flag. The Undo affordance from the design was
+  dropped: trials always restore state in `finally`, so there is nothing
+  for the wizard to undo.
+- Tests: `tests/test_ab_trial.py` (variant classification, store
+  round-trip + hash staleness, stamp-path and reload-path runs, event
+  shape, error path) and `TestAbTrialMeasured` in
+  `tests/test_model_recommendations.py`. Not verified against a live
+  model on this machine — the trial endpoints follow the same engine
+  contracts as `mtp_tune.py`/`benchmark.py`, but a real end-to-end run
+  is still worth doing when a model is loaded.
+
+## Phase 6 implementation notes (2026-07-11)
+
+- `omlx/admin/recommendations.py`: `_attach_estimated_gain(rec)` tags every
+  recommendation with an `estimated_gain` field — `{"measured": pct}` when
+  the rec already carries a `measured.gain_pct` (i.e. `mtp-use-auto` /
+  `mtp-tuned-optimal`, reusing the Phase 2a numbers, no new measurement
+  path), else `{"class": "high"|"medium"|"low", "basis": "heuristic"}` from
+  a small per-rule-id table (`mtp-enable` → high, `dflash-candidate` →
+  medium). Advice-only/procedural rules (`mtp-quantized-head`, `mtp-tune`)
+  get no estimate — there's nothing to quantify yet.
+- Ordering stays **severity-first** (unchanged Phase 1 contract, still
+  covered by `TestOrderingAndEmpty`); `estimated_gain` only breaks ties
+  within a severity tier via `_gain_sort_key` (measured, ranked by
+  descending %, before heuristic class, before no-estimate). This matches
+  the plan's non-goal: heuristics never invent numbers, they only rank.
+- `best_estimated_gain(recs)` picks the single biggest-estimated-gain rec
+  for the panel heading; new `GET .../recommendations` field `best_gain`
+  (endpoint in `routes.py`) carries `{id, title, estimated_gain}` or
+  `None`.
+- UI (`_modal_model_settings.html` + `dashboard.js`): panel header shows
+  "Biggest estimated gain: `<title>` (`<value>`)" when `best_gain` is
+  present; each rec row gets a small pill via `formatEstimatedGain()`
+  (`"+30.0% measured"` or `"high (estimate)"`). i18n keys added to
+  `en.json` and synced with `normalize_i18n.py` (fallback-by-value-copy,
+  same as the rest of the panel).
+- Tests: `TestEstimatedGain` in `tests/test_model_recommendations.py`
+  (heuristic tagging, measured tagging, no-estimate cases, `best_estimated_
+  gain` ranking and empty/None cases).
+
+## Phase 5 implementation notes (2026-07-11)
+
+- `omlx/patches/mlx_lm_mtp/batch_generator.py`: `_maybe_disable_low_acceptance_mtp`
+  now stamps `_omlx_mtp_auto_disabled_reason` / `_omlx_mtp_auto_disabled_at`
+  on the model instance (alongside the existing `_omlx_mtp_decode_enabled =
+  False` flip) instead of leaving the trip only visible in the log line.
+  New public accessor `mtp_runtime_status(model)` reads the per-instance
+  markers (`_model_mtp_decode_enabled`, `_mtp_draft_depth` — the latter
+  already applies the depth-1 clamp for models without
+  `mtp_forward_hidden`) and returns `None` when the model was never
+  MTP-stamped, else `{decode_active, effective_depth, auto_disabled,
+  auto_disabled_reason, auto_disabled_at}`. `auto_disabled` requires both
+  a stamped reason *and* `decode_active is False` — the guard is sticky
+  for the life of the loaded instance, so this can't disagree with itself.
+- `omlx/admin/capabilities.py`: `CapabilityContext` gained `mtp_runtime`
+  (the dict above, or `None` when the model isn't loaded),
+  `mtp_tuned_winner_depth`, `mtp_tuned_at`. `_mtp_live_block(ctx)` shapes
+  these into a `live` sub-dict attached to the mtp capability whenever
+  `mtp_enabled` is true (both the plain "active" branch and the
+  quantized-head branch, since a quantized head staying "active" is
+  exactly the case most likely to trip the guard).
+- `omlx/admin/routes.py` (`_build_capabilities_for`): when settings have
+  `mtp_enabled`, reads `entry.engine._model` (only present if the model
+  is actually loaded — untouched otherwise, so an unloaded model reports
+  `live.loaded: false` rather than erroring) and calls
+  `mtp_runtime_status`; separately reads `load_tune_entry` (already used
+  by the recommendations endpoint) for the tuned winner + timestamp,
+  independent of whether the model is currently loaded.
+- UI: capability card for MTP renders effective depth + tuned winner
+  inline, and an amber "Auto-disabled: <reason>" line when the guard has
+  tripped — the reason string already carries the quantized-head hint
+  when applicable, so no separate UI branch is needed for that.
+- Tests: `TestMtpLiveStatus` in `tests/test_model_capabilities.py` (data
+  shaping); `TestMtpRuntimeStatus` + a new stamp-on-trip case in
+  `tests/test_mlx_lm_mtp_patch.py` (guard + accessor).
+- Deliberate scope: only native MTP (`batch_generator.py`'s guard). VLM
+  MTP has its own acceptance logging (`scheduler.py::_log_vlm_mtp_stats`)
+  but no auto-disable guard today, so there's no live state to surface
+  there yet — out of scope for this pass.
 
 ## Phase 4 implementation notes (2026-07-11)
 

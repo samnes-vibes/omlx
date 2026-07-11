@@ -672,6 +672,20 @@
                                                         <li x-text="item"></li>
                                                     </template>
                                                 </ul>
+                                                <!-- Live MTP runtime state (advisor P5) -->
+                                                <div x-show="cap.live" x-cloak class="mt-1.5 text-xs">
+                                                    <span x-show="cap.live && !cap.live.loaded" class="text-neutral-400">{{ t('modal.model_settings.cap_live_not_loaded') }}</span>
+                                                    <template x-if="cap.live && cap.live.loaded">
+                                                        <div>
+                                                            <span x-show="!cap.live.auto_disabled" class="text-neutral-500"
+                                                                  x-text="`{{ t('modal.model_settings.cap_live_depth') }} ${cap.live.effective_depth}`"></span>
+                                                            <span x-show="cap.live.tuned_winner_depth !== null" class="text-neutral-400 ml-2"
+                                                                  x-text="`({{ t('modal.model_settings.cap_live_tuned_winner') }} ${cap.live.tuned_winner_depth}${cap.live.tuned_at ? ', ' + cap.live.tuned_at : ''})`"></span>
+                                                            <p x-show="cap.live.auto_disabled" x-cloak class="text-amber-700 font-medium mt-1"
+                                                               x-text="`{{ t('modal.model_settings.cap_live_auto_disabled') }} ${cap.live.auto_disabled_reason}`"></p>
+                                                        </div>
+                                                    </template>
+                                                </div>
                                             </div>
                                         </div>
                                     </template>
@@ -681,13 +695,111 @@
                                 <div x-show="modelRecsLoading || modelRecs.length > 0 || mtpTuneResult || recError" x-cloak
                                      class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                     <div class="flex items-center justify-between gap-3">
-                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.recommendations') }}</span>
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.recommendations') }}</span>
+                                            <p x-show="modelBestGain" x-cloak class="text-xs text-neutral-500 mt-0.5"
+                                               x-text="modelBestGain ? `{{ t('modal.model_settings.rec_best_gain') }}`.replace('{title}', modelBestGain.title).replace('{value}', formatEstimatedGain(modelBestGain.estimated_gain)) : ''"></p>
+                                        </div>
                                         <span x-show="modelRecsLoading" class="text-xs text-neutral-400">{{ t('modal.model_settings.recommendations_loading') }}</span>
-                                        <button type="button" x-show="recsHaveSettingsActions" x-cloak
+                                        <button type="button" x-show="modelRecs.length > 0 && !wizardActive" x-cloak
+                                                @click="startWizard()"
+                                                :disabled="applyingRecId !== null || mtpTuneRunning"
+                                                :class="selectedModel && wizardShowNudge(selectedModel.id) ? 'ring-2 ring-amber-400' : ''"
+                                                class="flex-shrink-0 px-3 py-1.5 text-xs font-medium bg-black text-white rounded-lg hover:bg-neutral-800 transition-colors disabled:opacity-40">{{ t('modal.model_settings.wizard_guide_me') }}</button>
+                                        <button type="button" x-show="recsHaveSettingsActions && !wizardActive" x-cloak
                                                 @click="applyAllRecommendations()"
                                                 :disabled="applyingRecId !== null || mtpTuneRunning"
                                                 class="flex-shrink-0 px-3 py-1.5 text-xs font-medium border border-neutral-300 text-neutral-700 rounded-lg hover:bg-neutral-100 transition-colors disabled:opacity-40"
                                                 x-text="applyingRecId === '__all__' ? '{{ t('modal.model_settings.rec_applying') }}' : '{{ t('modal.model_settings.rec_apply_all') }}'"></button>
+                                    </div>
+
+                                    <!-- Guided wizard (advisor P7): one recommendation at a time -->
+                                    <div x-show="wizardActive" x-cloak class="p-3 bg-white rounded-lg border-2 border-neutral-300 space-y-3">
+                                        <div class="flex items-center justify-between gap-3">
+                                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-500"
+                                                  x-text="wizardFinished
+                                                      ? '{{ t('modal.model_settings.wizard_done_title') }}'
+                                                      : `{{ t('modal.model_settings.wizard_step') }}`.replace('{i}', wizardIndex + 1).replace('{n}', wizardRecs.length)"></span>
+                                            <button type="button" @click="closeWizard()"
+                                                    class="text-xs text-neutral-400 hover:text-neutral-600">{{ t('modal.model_settings.wizard_close') }}</button>
+                                        </div>
+
+                                        <!-- Step: explain + decide -->
+                                        <template x-if="wizardCurrentRec">
+                                            <div class="space-y-2">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="flex-shrink-0 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full"
+                                                          :class="{
+                                                              'bg-red-100 text-red-700': wizardCurrentRec.severity === 'warn',
+                                                              'bg-amber-100 text-amber-700': wizardCurrentRec.severity === 'suggest',
+                                                              'bg-neutral-100 text-neutral-600': wizardCurrentRec.severity === 'info',
+                                                          }"
+                                                          x-text="wizardCurrentRec.severity === 'warn' ? '{{ t('modal.model_settings.rec_severity_warn') }}' : (wizardCurrentRec.severity === 'suggest' ? '{{ t('modal.model_settings.rec_severity_suggest') }}' : '{{ t('modal.model_settings.rec_severity_info') }}')"></span>
+                                                    <p class="text-sm font-medium text-neutral-700" x-text="wizardCurrentRec.title"></p>
+                                                    <span x-show="wizardCurrentRec.estimated_gain" x-cloak
+                                                          class="flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-neutral-100 text-neutral-500"
+                                                          x-text="formatEstimatedGain(wizardCurrentRec.estimated_gain)"></span>
+                                                </div>
+                                                <p class="text-xs text-neutral-500" x-text="wizardCurrentRec.detail"></p>
+
+                                                <!-- Optional compare (A/B trial, advisor P2b) -->
+                                                <div x-show="wizardCurrentRec.action && wizardCurrentRec.action.type === 'settings'" x-cloak class="space-y-1.5">
+                                                    <div x-show="abTrialRunning" class="text-xs text-neutral-500">
+                                                        <span>{{ t('modal.model_settings.wizard_trial_running') }}</span>
+                                                        <span x-show="abTrialProgress" x-cloak
+                                                              x-text="abTrialProgress ? ` ${abTrialProgress.completed}/${abTrialProgress.total} (${abTrialProgress.variant}: ${Number(abTrialProgress.tps).toFixed(1)} tok/s)` : ''"></span>
+                                                    </div>
+                                                    <div x-show="abTrialResult" x-cloak class="text-xs text-neutral-600">
+                                                        <span class="font-medium text-neutral-700">{{ t('modal.model_settings.wizard_trial_result') }}</span>
+                                                        <span x-text="abTrialResult ? ` ${'{{ t('modal.model_settings.wizard_trial_current') }}'} ${Number(abTrialResult.variants?.current?.tps_median ?? 0).toFixed(1)} tok/s · ${'{{ t('modal.model_settings.wizard_trial_candidate') }}'} ${Number(abTrialResult.variants?.candidate?.tps_median ?? 0).toFixed(1)} tok/s` : ''"></span>
+                                                        <span x-show="abTrialResult && abTrialResult.gain_pct !== null" x-cloak
+                                                              class="font-semibold"
+                                                              :class="abTrialResult && abTrialResult.gain_pct >= 0 ? 'text-green-700' : 'text-red-700'"
+                                                              x-text="abTrialResult ? ` (${abTrialResult.gain_pct >= 0 ? '+' : ''}${abTrialResult.gain_pct}%)` : ''"></span>
+                                                    </div>
+                                                    <p x-show="abTrialError" x-cloak class="text-xs text-red-500" x-text="abTrialError"></p>
+                                                </div>
+
+                                                <div class="flex items-center gap-2 pt-1">
+                                                    <button type="button" x-show="wizardCurrentRec.action"
+                                                            @click="wizardApply(wizardCurrentRec)"
+                                                            :disabled="applyingRecId !== null || mtpTuneRunning || abTrialRunning"
+                                                            class="px-3 py-1.5 text-xs font-medium bg-black text-white rounded-lg hover:bg-neutral-800 transition-colors disabled:opacity-40"
+                                                            x-text="(applyingRecId !== null || mtpTuneRunning)
+                                                                ? '{{ t('modal.model_settings.rec_applying') }}'
+                                                                : (wizardCurrentRec.action && wizardCurrentRec.action.type === 'mtp_tune' ? '{{ t('modal.model_settings.rec_run_tune') }}' : '{{ t('modal.model_settings.rec_apply') }}')"></button>
+                                                    <button type="button" x-show="wizardCurrentRec.action && wizardCurrentRec.action.type === 'settings' && !abTrialResult"
+                                                            @click="runAbTrial(wizardCurrentRec)"
+                                                            :disabled="abTrialRunning || applyingRecId !== null || mtpTuneRunning"
+                                                            class="px-3 py-1.5 text-xs font-medium border border-neutral-300 text-neutral-700 rounded-lg hover:bg-neutral-100 transition-colors disabled:opacity-40">{{ t('modal.model_settings.wizard_compare') }}</button>
+                                                    <button type="button"
+                                                            @click="wizardSkip(wizardCurrentRec)"
+                                                            :disabled="abTrialRunning"
+                                                            class="px-3 py-1.5 text-xs font-medium text-neutral-500 rounded-lg hover:bg-neutral-100 transition-colors disabled:opacity-40"
+                                                            x-text="wizardCurrentRec.action ? '{{ t('modal.model_settings.wizard_skip') }}' : '{{ t('modal.model_settings.wizard_next') }}'"></button>
+                                                </div>
+                                            </div>
+                                        </template>
+
+                                        <!-- Finish: summary + escape hatch -->
+                                        <template x-if="wizardFinished">
+                                            <div class="space-y-2 text-xs text-neutral-600">
+                                                <p x-show="wizardSummary.applied.length"
+                                                   x-text="`{{ t('modal.model_settings.wizard_summary_applied') }} ${wizardSummary.applied.join(', ')}`"></p>
+                                                <p x-show="wizardSummary.skipped.length"
+                                                   x-text="`{{ t('modal.model_settings.wizard_summary_skipped') }} ${wizardSummary.skipped.join(', ')}`"></p>
+                                                <p x-show="!wizardSummary.applied.length && !wizardSummary.skipped.length">{{ t('modal.model_settings.wizard_summary_none') }}</p>
+                                                <div class="flex items-center gap-2 pt-1">
+                                                    <button type="button" x-show="wizardRemainingActionable" x-cloak
+                                                            @click="wizardApplyRemaining()"
+                                                            :disabled="applyingRecId !== null"
+                                                            class="px-3 py-1.5 text-xs font-medium border border-neutral-300 text-neutral-700 rounded-lg hover:bg-neutral-100 transition-colors disabled:opacity-40"
+                                                            x-text="applyingRecId === '__all__' ? '{{ t('modal.model_settings.rec_applying') }}' : '{{ t('modal.model_settings.wizard_apply_remaining') }}'"></button>
+                                                    <button type="button" @click="closeWizard()"
+                                                            class="px-3 py-1.5 text-xs font-medium bg-black text-white rounded-lg hover:bg-neutral-800 transition-colors">{{ t('modal.model_settings.wizard_finish') }}</button>
+                                                </div>
+                                            </div>
+                                        </template>
                                     </div>
                                     <template x-for="rec in modelRecs" :key="rec.id">
                                         <div class="flex items-start gap-3 p-3 bg-white rounded-lg border border-neutral-200">
@@ -699,7 +811,12 @@
                                                   }"
                                                   x-text="rec.severity === 'warn' ? '{{ t('modal.model_settings.rec_severity_warn') }}' : (rec.severity === 'suggest' ? '{{ t('modal.model_settings.rec_severity_suggest') }}' : '{{ t('modal.model_settings.rec_severity_info') }}')"></span>
                                             <div class="min-w-0 flex-1">
-                                                <p class="text-sm font-medium text-neutral-700" x-text="rec.title"></p>
+                                                <div class="flex items-center gap-2">
+                                                    <p class="text-sm font-medium text-neutral-700" x-text="rec.title"></p>
+                                                    <span x-show="rec.estimated_gain" x-cloak
+                                                          class="flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-neutral-100 text-neutral-500"
+                                                          x-text="formatEstimatedGain(rec.estimated_gain)"></span>
+                                                </div>
                                                 <p class="text-xs text-neutral-500 mt-0.5" x-text="rec.detail"></p>
                                                 <div x-show="rec.measured" x-cloak class="mt-1.5 text-xs text-neutral-500">
                                                     <template x-for="[d, tps] in Object.entries(rec.measured?.tps_by_depth || {})" :key="d">
@@ -707,8 +824,10 @@
                                                               :class="Number(d) === rec.measured?.winner_depth ? 'font-semibold text-neutral-700' : ''"
                                                               x-text="`d${d}: ${Number(tps).toFixed(1)} tok/s`"></span>
                                                     </template>
-                                                    <span x-show="rec.measured?.tuned_at" class="text-neutral-400"
-                                                          x-text="rec.measured ? `(${'{{ t('modal.model_settings.rec_measured_at') }}'} ${rec.measured.tuned_at})` : ''"></span>
+                                                    <span x-show="rec.measured?.source === 'ab_trial'" x-cloak
+                                                          x-text="rec.measured ? `{{ t('modal.model_settings.wizard_trial_current') }} ${Number(rec.measured.baseline_tps ?? 0).toFixed(1)} tok/s · {{ t('modal.model_settings.wizard_trial_candidate') }} ${Number(rec.measured.candidate_tps ?? 0).toFixed(1)} tok/s` : ''"></span>
+                                                    <span x-show="rec.measured?.tuned_at || rec.measured?.trial_at" class="text-neutral-400"
+                                                          x-text="rec.measured ? `(${'{{ t('modal.model_settings.rec_measured_at') }}'} ${rec.measured.tuned_at || rec.measured.trial_at})` : ''"></span>
                                                 </div>
                                             </div>
                                             <button type="button" x-show="rec.action && rec.action.type === 'settings'"

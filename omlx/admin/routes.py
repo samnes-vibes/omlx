@@ -2068,6 +2068,7 @@ def _build_recommendations_for(model_id: str) -> list[dict]:
     """
     from ..admin.mtp_tune import load_tune_entry
     from ..utils.model_loading import _mtp_weights_quantized
+    from .ab_trial import load_trial_results, settings_hash
     from .recommendations import RecommendationContext, build_recommendations
 
     engine_pool = _get_engine_pool()
@@ -2085,7 +2086,18 @@ def _build_recommendations_for(model_id: str) -> list[dict]:
     dflash_ok, _ = _dflash_compat_for_model(model_info)
 
     mtp_enabled = bool(getattr(settings, "mtp_enabled", False))
-    tune_entry = load_tune_entry(Path(entry.model_path).name)
+    model_key = Path(entry.model_path).name
+    tune_entry = load_tune_entry(model_key)
+    # P2b: measured A/B trial results for this exact settings state —
+    # hash-filtered so a trial run against different settings is not quoted.
+    ab_results: dict = {}
+    if settings is not None:
+        try:
+            ab_results = load_trial_results(
+                model_key, settings_hash(settings.to_dict())
+            )
+        except Exception:
+            logger.warning("Failed to load A/B trial results", exc_info=True)
     ctx = RecommendationContext(
         mtp_compatible=mtp_ok,
         mtp_compatibility_reason=mtp_reason,
@@ -2105,6 +2117,7 @@ def _build_recommendations_for(model_id: str) -> list[dict]:
             int(tune_entry["depth"]) if tune_entry is not None else None
         ),
         mtp_tune_entry=tune_entry,
+        ab_trial_results=ab_results,
     )
     return build_recommendations(ctx)
 
@@ -2120,9 +2133,13 @@ async def model_recommendations(
     quantized-MTP-head detector, the MTP tune store) — see
     docs/experimental/model_optimization_advisor_plan.md.
     """
+    from .recommendations import best_estimated_gain
+
+    recs = _build_recommendations_for(model_id)
     return {
         "model_id": model_id,
-        "recommendations": _build_recommendations_for(model_id),
+        "recommendations": recs,
+        "best_gain": best_estimated_gain(recs),
     }
 
 
@@ -2177,6 +2194,23 @@ def _build_capabilities_for(model_id: str) -> list[dict]:
 
     settings_manager = _get_settings_manager()
     settings = settings_manager.get_settings(model_id) if settings_manager else None
+    mtp_enabled = bool(getattr(settings, "mtp_enabled", False))
+
+    mtp_runtime = None
+    mtp_tuned_winner_depth = None
+    mtp_tuned_at = None
+    if mtp_enabled:
+        model = getattr(entry.engine, "_model", None)
+        if model is not None:
+            from ..patches.mlx_lm_mtp.batch_generator import mtp_runtime_status
+
+            mtp_runtime = mtp_runtime_status(model)
+        from .mtp_tune import load_tune_entry
+
+        tune_entry = load_tune_entry(model_path.name)
+        if tune_entry is not None:
+            mtp_tuned_winner_depth = int(tune_entry["depth"])
+            mtp_tuned_at = tune_entry.get("tuned_at")
 
     ctx = CapabilityContext(
         model_type=model_type,
@@ -2190,7 +2224,7 @@ def _build_capabilities_for(model_id: str) -> list[dict]:
         mtp_head_quantized=head_quantized,
         dflash_supported=dflash_ok,
         dflash_reason=dflash_reason,
-        mtp_enabled=bool(getattr(settings, "mtp_enabled", False)),
+        mtp_enabled=mtp_enabled,
         dflash_enabled=bool(getattr(settings, "dflash_enabled", False)),
         dflash_draft_model=getattr(settings, "dflash_draft_model", None),
         vlm_mtp_enabled=bool(getattr(settings, "vlm_mtp_enabled", False)),
@@ -2200,6 +2234,9 @@ def _build_capabilities_for(model_id: str) -> list[dict]:
         turboquant_kv_enabled=bool(
             getattr(settings, "turboquant_kv_enabled", False)
         ),
+        mtp_runtime=mtp_runtime,
+        mtp_tuned_winner_depth=mtp_tuned_winner_depth,
+        mtp_tuned_at=mtp_tuned_at,
     )
     return build_capabilities(ctx)
 
@@ -2336,6 +2373,156 @@ async def mtp_tune_model(
         logger.exception("MTP tune failed for %s", model_id)
         raise HTTPException(status_code=500, detail=str(e))
     return {"status": "ok", **result}
+
+
+@router.post("/api/models/{model_id}/recommendations/{rec_id}/ab-trial")
+async def start_ab_trial(
+    model_id: str,
+    rec_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start a current-vs-candidate A/B throughput trial for one
+    recommendation (advisor P2b).
+
+    Re-runs the rule engine server-side (so the candidate payload can't be
+    spoofed), builds the two variants from persisted settings + the rec's
+    settings payload, and starts the trial as a background task. 409 when
+    another trial or a throughput benchmark is already running — both
+    stress the same engine.
+    """
+    from .ab_trial import (
+        changed_keys,
+        cleanup_old_trials,
+        create_trial_run,
+        get_active_trial,
+        requires_reload,
+        run_ab_trial,
+        settings_hash,
+    )
+    from .benchmark import get_active_run
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    active_trial = get_active_trial()
+    if active_trial is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"An A/B trial is already running (trial_id={active_trial.trial_id}).",
+        )
+    active_bench = get_active_run()
+    if active_bench is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A throughput benchmark is already running "
+                f"(bench_id={active_bench.bench_id})."
+            ),
+        )
+
+    recs = _build_recommendations_for(model_id)
+    rec = next((r for r in recs if r["id"] == rec_id), None)
+    if rec is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No current recommendation with id: {rec_id}",
+        )
+    action = rec.get("action") or {}
+    if action.get("type") != "settings" or not action.get("payload"):
+        raise HTTPException(
+            status_code=400,
+            detail="This recommendation has no settings change to trial",
+        )
+
+    settings_manager = _require_settings_manager()
+    current = settings_manager.get_settings(model_id).to_dict()
+    candidate = {**current, **action["payload"]}
+    variants = [
+        {"label": "current", "settings": current},
+        {"label": "candidate", "settings": candidate},
+    ]
+    reload_needed = requires_reload(changed_keys(variants), current)
+
+    cleanup_old_trials()
+    run = create_trial_run(
+        model_id=model_id,
+        model_key=Path(entry.model_path).name,
+        rec_id=rec_id,
+        variants=variants,
+        current_hash=settings_hash(current),
+        reload_needed=reload_needed,
+    )
+    run.task = asyncio.create_task(
+        run_ab_trial(run, engine_pool, settings_manager)
+    )
+    logger.info(
+        "A/B trial started: %s model=%s rec=%s reload_required=%s",
+        run.trial_id,
+        model_id,
+        rec_id,
+        reload_needed,
+    )
+    return {
+        "trial_id": run.trial_id,
+        "status": "started",
+        "reload_required": reload_needed,
+    }
+
+
+@router.get("/api/models/{model_id}/ab-trial/{trial_id}/stream")
+async def stream_ab_trial(
+    model_id: str,
+    trial_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stream A/B trial progress via SSE (same replay-then-attach shape
+    as /api/bench/{id}/stream, so the frontend reuses its SSE handling)."""
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from .ab_trial import get_trial
+
+    run = get_trial(trial_id)
+    if run is None or run.model_id != model_id:
+        raise HTTPException(status_code=404, detail=f"Trial not found: {trial_id}")
+
+    async def event_generator():
+        seen = 0
+        try:
+            while True:
+                async with run.cond:
+                    while seen >= len(run.events) and not run.terminal:
+                        try:
+                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                        except TimeoutError:
+                            break
+                    new = list(run.events[seen:])
+                    seen = len(run.events)
+                    done = run.terminal
+
+                for ev in new:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                if not new and not done:
+                    yield ": keepalive\n\n"
+                if done:
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/api/reload")

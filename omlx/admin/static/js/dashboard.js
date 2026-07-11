@@ -174,12 +174,24 @@
             savingModelSettings: false,
             modelRecs: [],
             modelRecsLoading: false,
+            modelBestGain: null,
             modelCaps: [],
             modelCapsLoading: false,
             recError: '',
             applyingRecId: null,
             mtpTuneRunning: false,
             mtpTuneResult: null,
+            // Guided wizard over modelRecs (advisor P7) — purely client-side.
+            wizardActive: false,
+            wizardIndex: 0,
+            wizardOutcomes: {},          // rec id -> 'applied' | 'skipped'
+            wizardRecIds: [],            // snapshot of rec order at wizard start
+            // A/B trial (advisor P2b) state for the wizard's compare step.
+            abTrialRunning: false,
+            abTrialProgress: null,       // {variant, tps, completed, total}
+            abTrialResult: null,         // final 'result' SSE event
+            abTrialError: '',
+            abTrialEventSource: null,
             loadingGenDefaults: false,
             reasoningParsers: [],
 
@@ -1896,6 +1908,7 @@
                 }
                 this.showModelSettingsModal = true;
                 if (!isDiffusion) {
+                    this.closeWizard();
                     this.loadRecommendations(model.id);
                     this.loadCapabilities(model.id);
                 }
@@ -1918,6 +1931,7 @@
 
             async loadRecommendations(modelId) {
                 this.modelRecs = [];
+                this.modelBestGain = null;
                 this.recError = '';
                 this.mtpTuneResult = null;
                 this.modelRecsLoading = true;
@@ -1926,6 +1940,7 @@
                     if (resp.ok) {
                         const data = await resp.json();
                         this.modelRecs = data.recommendations || [];
+                        this.modelBestGain = data.best_gain || null;
                     } else if (resp.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -1959,6 +1974,16 @@
                     this.recError = 'Failed to apply recommendation';
                 }
                 this.applyingRecId = null;
+            },
+
+            formatEstimatedGain(gain) {
+                if (!gain) return '';
+                if ('measured' in gain) {
+                    const pct = Number(gain.measured);
+                    return `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}% ${window.t('modal.model_settings.rec_gain_measured')}`;
+                }
+                const clsLabel = window.t(`modal.model_settings.rec_gain_class_${gain.class}`) || gain.class;
+                return `${clsLabel} (${window.t('modal.model_settings.rec_gain_estimate')})`;
             },
 
             get recsHaveSettingsActions() {
@@ -2016,6 +2041,165 @@
                     this.recError = 'MTP tune failed';
                 }
                 this.mtpTuneRunning = false;
+            },
+
+            // --- Guided wizard over recommendations (advisor P7) ---
+            // Works on a snapshot of modelRecs taken at start, so the flat
+            // panel reloading after each Apply never shifts the step order.
+            wizardRecs: [],
+
+            startWizard() {
+                if (!this.modelRecs.length) return;
+                this.wizardRecs = this.modelRecs.map(r => ({ ...r }));
+                this.wizardOutcomes = {};
+                this.wizardIndex = 0;
+                this.wizardActive = true;
+                this._resetAbTrial();
+                try {
+                    if (this.selectedModel) {
+                        localStorage.setItem(`omlx_wizard_seen_${this.selectedModel.id}`, '1');
+                    }
+                } catch (e) {}
+            },
+
+            get wizardCurrentRec() {
+                return this.wizardActive ? (this.wizardRecs[this.wizardIndex] || null) : null;
+            },
+
+            get wizardFinished() {
+                return this.wizardActive && this.wizardIndex >= this.wizardRecs.length;
+            },
+
+            get wizardSummary() {
+                const applied = [], skipped = [];
+                for (const rec of this.wizardRecs) {
+                    const outcome = this.wizardOutcomes[rec.id];
+                    if (outcome === 'applied') applied.push(rec.title);
+                    else if (outcome === 'skipped') skipped.push(rec.title);
+                }
+                return { applied, skipped };
+            },
+
+            get wizardRemainingActionable() {
+                return this.wizardRecs.some(r =>
+                    !this.wizardOutcomes[r.id] && r.action && r.action.type === 'settings');
+            },
+
+            wizardShowNudge(modelId) {
+                try {
+                    return !localStorage.getItem(`omlx_wizard_seen_${modelId}`)
+                        && this.modelRecs.some(r => r.severity === 'warn' || r.severity === 'suggest');
+                } catch (e) { return false; }
+            },
+
+            _wizardAdvance() {
+                this._resetAbTrial();
+                this.wizardIndex += 1;
+            },
+
+            async wizardApply(rec) {
+                if (rec.action && rec.action.type === 'settings') {
+                    await this.applyRecommendation(rec);
+                    if (this.recError) return; // stay on the step, show the error
+                } else if (rec.action && rec.action.type === 'mtp_tune') {
+                    await this.runMtpTune();
+                    if (this.recError) return;
+                }
+                this.wizardOutcomes[rec.id] = 'applied';
+                this._wizardAdvance();
+            },
+
+            wizardSkip(rec) {
+                this.wizardOutcomes[rec.id] = 'skipped';
+                this._wizardAdvance();
+            },
+
+            async wizardApplyRemaining() {
+                await this.applyAllRecommendations();
+                if (this.recError) return;
+                for (const rec of this.wizardRecs) {
+                    if (!this.wizardOutcomes[rec.id] && rec.action && rec.action.type === 'settings') {
+                        this.wizardOutcomes[rec.id] = 'applied';
+                    }
+                }
+                this.wizardIndex = this.wizardRecs.length;
+            },
+
+            closeWizard() {
+                this.wizardActive = false;
+                this.wizardRecs = [];
+                this.wizardOutcomes = {};
+                this.wizardIndex = 0;
+                this._resetAbTrial();
+            },
+
+            _resetAbTrial() {
+                if (this.abTrialEventSource) {
+                    this.abTrialEventSource.close();
+                    this.abTrialEventSource = null;
+                }
+                this.abTrialRunning = false;
+                this.abTrialProgress = null;
+                this.abTrialResult = null;
+                this.abTrialError = '';
+            },
+
+            // --- A/B trial (advisor P2b): compare current vs candidate ---
+            async runAbTrial(rec) {
+                if (!this.selectedModel || this.abTrialRunning) return;
+                this._resetAbTrial();
+                this.abTrialRunning = true;
+                const modelId = this.selectedModel.id;
+                try {
+                    const resp = await fetch(
+                        `/admin/api/models/${encodeURIComponent(modelId)}/recommendations/${encodeURIComponent(rec.id)}/ab-trial`,
+                        { method: 'POST' });
+                    const data = await resp.json().catch(() => ({}));
+                    if (!resp.ok) {
+                        this.abTrialError = data.detail || 'Failed to start A/B trial';
+                        this.abTrialRunning = false;
+                        return;
+                    }
+                    this.connectAbTrialSSE(modelId, data.trial_id);
+                } catch (e) {
+                    this.abTrialError = 'Failed to start A/B trial';
+                    this.abTrialRunning = false;
+                }
+            },
+
+            connectAbTrialSSE(modelId, trialId) {
+                const es = new EventSource(
+                    `/admin/api/models/${encodeURIComponent(modelId)}/ab-trial/${encodeURIComponent(trialId)}/stream`);
+                this.abTrialEventSource = es;
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'progress') {
+                            this.abTrialProgress = data;
+                        } else if (data.type === 'result') {
+                            this.abTrialResult = data;
+                            this.abTrialRunning = false;
+                            es.close();
+                            this.abTrialEventSource = null;
+                            // Persisted result now backs the rec's measured
+                            // field — refresh the flat panel numbers too.
+                            if (this.selectedModel) this.loadRecommendations(this.selectedModel.id);
+                        } else if (data.type === 'error') {
+                            this.abTrialError = data.message || 'A/B trial failed';
+                            this.abTrialRunning = false;
+                            es.close();
+                            this.abTrialEventSource = null;
+                        }
+                    } catch (e) { /* malformed event */ }
+                };
+                es.onerror = () => {
+                    if (this.abTrialRunning) {
+                        this.abTrialError = 'A/B trial stream disconnected';
+                        this.abTrialRunning = false;
+                    }
+                    es.close();
+                    this.abTrialEventSource = null;
+                };
             },
 
             async saveModelSettings() {

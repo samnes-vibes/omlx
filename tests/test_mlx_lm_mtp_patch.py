@@ -2254,3 +2254,73 @@ class TestAcceptanceFloorGuard:
         model = SimpleNamespace(language_model=inner)
         assert _maybe_disable_low_acceptance_mtp(model, self._stats(100, 0))
         assert inner._omlx_mtp_decode_enabled is False
+
+    def test_stamps_reason_and_timestamp_on_trip(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+        )
+
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True, _omlx_mtp_head_quantized=False
+        )
+        assert _maybe_disable_low_acceptance_mtp(model, self._stats(100, 5))
+        assert "floor" in model._omlx_mtp_auto_disabled_reason
+        assert model._omlx_mtp_auto_disabled_at
+
+
+class TestMtpRuntimeStatus:
+    def test_none_for_unstamped_model(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import mtp_runtime_status
+
+        assert mtp_runtime_status(SimpleNamespace()) is None
+
+    def test_healthy_active_model(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import mtp_runtime_status
+
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True, _omlx_mtp_draft_depth=2
+        )
+        status = mtp_runtime_status(model)
+        assert status["decode_active"] is True
+        # No mtp_forward_hidden hook on this bare model -> clamps to depth 1.
+        assert status["effective_depth"] == 1
+        assert status["auto_disabled"] is False
+        assert status["auto_disabled_reason"] is None
+
+    def test_reports_auto_disabled_reason(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+            mtp_runtime_status,
+        )
+
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True, _omlx_mtp_head_quantized=True
+        )
+        _maybe_disable_low_acceptance_mtp(model, self._stats(100, 5))
+        status = mtp_runtime_status(model)
+        assert status["decode_active"] is False
+        assert status["auto_disabled"] is True
+        assert "quantized" in status["auto_disabled_reason"]
+        assert status["auto_disabled_at"]
+
+    def _stats(self, drafted, accepted):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _MtpStats
+
+        return _MtpStats(
+            cycles=drafted, draft_tokens=drafted, accepted_drafts=accepted
+        )
+
+    def test_inner_language_model_reason_visible(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _maybe_disable_low_acceptance_mtp,
+            mtp_runtime_status,
+        )
+
+        inner = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True, _omlx_mtp_head_quantized=False
+        )
+        model = SimpleNamespace(language_model=inner)
+        _maybe_disable_low_acceptance_mtp(model, self._stats(100, 0))
+        status = mtp_runtime_status(model)
+        assert status["auto_disabled"] is True
+        assert status["auto_disabled_reason"]
