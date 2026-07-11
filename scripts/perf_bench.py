@@ -349,6 +349,7 @@ def run_streaming_completion(
     url = f"{base_url}/v1/chat/completions"
     start = time.perf_counter()
     ttft = None
+    last_chunk_t = None
     completion_tokens = None
     chunks = 0
     with _request(url, payload=payload, method="POST", token=token) as resp:
@@ -369,13 +370,37 @@ def run_streaming_completion(
             for choice in chunk.get("choices", []):
                 if choice.get("delta", {}).get("content"):
                     chunks += 1
+                    now = time.perf_counter() - start
                     if ttft is None:
-                        ttft = time.perf_counter() - start
+                        ttft = now
+                    last_chunk_t = now
     total = time.perf_counter() - start
     if ttft is None:
         ttft = total
     n_tokens = completion_tokens if completion_tokens else chunks
-    return ttft, max(total - ttft, 1e-9), n_tokens
+    # Some transports (e.g. urllib buffering a fast local response) deliver
+    # every content chunk in one burst, making ttft ≈ total and collapsing
+    # the decode window to ~0 — dividing tokens by that near-zero window
+    # produces nonsense tok/s (seen: 400k+ on a real 27B model). Detect the
+    # degenerate split (last chunk arrived within 1ms of the first, or only
+    # one chunk total) and fall back to spreading the *whole* request time
+    # over the decode calculation instead of a clamped near-zero window.
+    decode_s = (last_chunk_t or total) - ttft
+    if chunks <= 1 or decode_s < 1e-3:
+        if not _WARNED_BURST["seen"]:
+            print(
+                "warning: chunk timing looks bursty (ttft ≈ total) — "
+                "falling back to whole-request timing for tok/s; treat "
+                "these numbers as approximate",
+                file=sys.stderr,
+            )
+            _WARNED_BURST["seen"] = True
+        decode_s = total
+        ttft = 0.0
+    return ttft, max(decode_s, 1e-9), n_tokens
+
+
+_WARNED_BURST = {"seen": False}
 
 
 def run_scenario(base_url, model, name, runs, warmup, token=None, cache_bust=False):

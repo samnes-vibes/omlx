@@ -70,6 +70,39 @@ täyte. P0.2-tarkistuslista on tämän dokumentin yllä olevassa osiossa;
 linkki fused_int4_attention_plan.md:stä lisätään erikseen (tiedostossa
 on työn alla olevia muokkauksia).
 
+**Bugikorjaus (2026-07-11):** `run_streaming_completion`'in
+tok/s-laskenta (`n / max(total - ttft, 1e-9)`) tuotti mielettömiä lukuja
+(satojen tuhansien tok/s luokkaa) kun asiakas vastaanotti koko vastauksen
+yhtenä purskeena (esim. urllib puskuroi paikallisen, nopean vastauksen
+kokonaan) — `ttft ≈ total` painoi jakajan lähes nollaan. Korjattu: jos
+sisältöpaloja tuli ≤1 tai viimeinen ja ensimmäinen saapuivat alle 1 ms
+sisällä toisistaan, koko pyynnön aika käytetään decode-ikkunana ja
+komento tulostaa kertaluontoisen varoituksen stderriin. **Sama bugi
+vaikutti myös kaikkiin aiempiin `--ab`/`--sweep-values`-ajoihin tällä
+raudalla** — niiden tok/s-lukuja ei pidä luottaa ilman uudelleenajoa.
+
+**Ensimmäinen mitattu MTP-datapiste (Qwen 27B, depth oletko tuntematon —
+`mtp_draft_depth` ei ollut viritetty, todennäköisesti 1):**
+
+| context | α (accept) | draft ms/cyc | verify ms/cyc | arvioitu tok/s* |
+|---|---|---|---|---|
+| 64 | 71.6 % | 4.59 | 77.49 | ~20.9 |
+| 512 | 65.8 % | 4.59 | 78.15 | ~19.0 |
+| 2048 | 65.8 % | 4.59 | 79.59 | ~18.7 |
+| 4096 | 72.6 % | 4.61 | 81.77 | ~20.0 |
+
+*Laskettu jälkikäteen server-puolen α/ms-luvuista (`tok/s ≈ (1+α) /
+((draft_ms+verify_ms)/1000)`), koska raakojen ajojen tok/s-sarake kärsi
+yllä olevasta bugista — nämä ovat siis arvioita, ei suoraan mitattuja.
+**Havainto:** verify_ms kasvaa lievästi kontekstin mukana (77→82 ms,
++5.5 %) 64→4096 välillä, α pysyy vakaana (~66–73 %) — ei dramaattista
+hiipumista tässä haarukassa. Draft-osuus kokonaisajasta on pieni
+(draft_ms / (draft_ms+verify_ms) ≈ 5–6 %), mikä on **selvästi alle P1:n
+30 %:n limitys-kannattavuusrajan** — jos tämä pitää paikkansa uudelleen
+mitattuna, P1 (overlap-spike) ei ole perusteltu MTP:lle tällä raudalla;
+ANE-spike (P3) putoaa pois samalla. Vahvistus vaatii korjatulla
+skriptillä uudelleenajon + DFlash/ngram-vertailun samalta koneelta.
+
 ### P0.2 Kernel-precision-tarkistuslista
 
 mirror-sd:n Phase 2 -sudenkuopat + omat fused-int4-oppimme yhteen paikkaan.
