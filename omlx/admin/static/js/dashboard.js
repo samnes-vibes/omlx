@@ -1943,6 +1943,37 @@
                 this.applyingRecId = null;
             },
 
+            get recsHaveSettingsActions() {
+                return this.modelRecs.some(r => r.action && r.action.type === 'settings');
+            },
+
+            async applyAllRecommendations() {
+                if (!this.selectedModel || this.applyingRecId !== null) return;
+                this.applyingRecId = '__all__';
+                this.recError = '';
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/recommendations/apply-all`, {
+                        method: 'POST',
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (resp.ok) {
+                        await this.loadModels();
+                        const refreshed = this.models.find(m => m.id === this.selectedModel.id);
+                        if (refreshed) {
+                            this.selectedModel = refreshed;
+                            this.modelSettings = this.buildModelSettingsState(refreshed, refreshed.settings || {});
+                        }
+                        await this.loadProfilesForModel(this.selectedModel.id);
+                        await this.loadRecommendations(this.selectedModel.id);
+                    } else {
+                        this.recError = data.detail || 'Failed to apply recommendations';
+                    }
+                } catch (e) {
+                    this.recError = 'Failed to apply recommendations';
+                }
+                this.applyingRecId = null;
+            },
+
             async runMtpTune() {
                 if (!this.selectedModel || this.mtpTuneRunning) return;
                 this.mtpTuneRunning = true;

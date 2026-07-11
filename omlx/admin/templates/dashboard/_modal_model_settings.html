@@ -648,6 +648,11 @@
                                     <div class="flex items-center justify-between gap-3">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.recommendations') }}</span>
                                         <span x-show="modelRecsLoading" class="text-xs text-neutral-400">{{ t('modal.model_settings.recommendations_loading') }}</span>
+                                        <button type="button" x-show="recsHaveSettingsActions" x-cloak
+                                                @click="applyAllRecommendations()"
+                                                :disabled="applyingRecId !== null || mtpTuneRunning"
+                                                class="flex-shrink-0 px-3 py-1.5 text-xs font-medium border border-neutral-300 text-neutral-700 rounded-lg hover:bg-neutral-100 transition-colors disabled:opacity-40"
+                                                x-text="applyingRecId === '__all__' ? '{{ t('modal.model_settings.rec_applying') }}' : '{{ t('modal.model_settings.rec_apply_all') }}'"></button>
                                     </div>
                                     <template x-for="rec in modelRecs" :key="rec.id">
                                         <div class="flex items-start gap-3 p-3 bg-white rounded-lg border border-neutral-200">

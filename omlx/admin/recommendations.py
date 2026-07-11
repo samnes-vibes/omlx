@@ -242,3 +242,21 @@ def build_recommendations(ctx: RecommendationContext) -> list[dict]:
 
     recs.sort(key=lambda r: _SEVERITY_ORDER.get(r["severity"], 9))
     return recs
+
+
+def collect_settings_payload(recs: list[dict]) -> tuple[dict, list[str]]:
+    """Merge every settings-action payload into one dict (P3 apply-all).
+
+    Returns ``(payload, rec_ids)``. Rules recommend disjoint keys by
+    construction (mutually exclusive conditions), so a plain merge in
+    severity order is safe; a later duplicate key would win.
+    """
+    payload: dict = {}
+    ids: list[str] = []
+    for rec in recs:
+        action = rec.get("action") or {}
+        if action.get("type") != "settings":
+            continue
+        payload.update(action.get("payload") or {})
+        ids.append(rec["id"])
+    return payload, ids

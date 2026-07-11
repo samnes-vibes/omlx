@@ -3,8 +3,9 @@
 Date: 2026-07-10
 Branch: `feat/mtp-multi-depth`
 Status: **Phase 1 implemented** (2026-07-10); **Phase 2a (measured
-tune-store recommendations) implemented** (2026-07-11) — see implementation
-notes at the end. Phase 2b (A/B trials + SSE) and Phase 3 not started.
+tune-store recommendations) and Phase 3 (apply-as-profile) implemented**
+(2026-07-11) — see implementation notes at the end. Phase 2b (A/B trials
++ SSE) not started.
 Companion to: [mtplx_adoption_plan.md](mtplx_adoption_plan.md) (the MTP
 auto-tune endpoint this surfaces), [5x_speedup_research.md](5x_speedup_research.md)
 
@@ -87,12 +88,19 @@ the engine like `mtp_tune.py`) so "suggest" items can be upgraded to
 measured claims. Requires a background-run pattern (SSE progress like the
 benchmark tab) once trials take minutes.
 
-### Phase 3 — apply-as-profile (not started)
+### Phase 3 — apply-as-profile (implemented 2026-07-11)
 
 "Apply all" writes the recommended settings as a profile
-(`optimized-<date>`) via the existing profiles API instead of mutating
-base settings, making the whole change auditable and revertable in one
-click.
+(`optimized-<date>`, suffixed `-2`, `-3`… on collision) via the existing
+profiles machinery instead of mutating base settings, making the whole
+change auditable and revertable in one click.
+`POST /admin/api/models/{id}/recommendations/apply-all` re-runs the rule
+engine server-side, merges settings-action payloads
+(`collect_settings_payload`), saves the profile (description lists the
+applied rule ids) and applies it — so `active_profile_name` is stamped
+and the profiles UI shows the change. The UI button appears in the
+recommendations panel header whenever at least one settings-action
+recommendation is present; 400 when nothing is actionable.
 
 ### Out of scope
 

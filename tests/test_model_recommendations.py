@@ -6,6 +6,7 @@ from __future__ import annotations
 from omlx.admin.recommendations import (
     RecommendationContext,
     build_recommendations,
+    collect_settings_payload,
 )
 
 
@@ -223,6 +224,38 @@ class TestDflashCandidateRule:
             RecommendationContext(dflash_compatible=True, dflash_enabled=True)
         )
         assert "dflash-candidate" not in _ids(recs)
+
+
+class TestCollectSettingsPayload:
+    def test_merges_only_settings_actions(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_draft_depth=1,
+                mtp_tuned_depth=2,
+                mtp_head_quantized=True,  # warn, no action — must be skipped
+            )
+        )
+        payload, ids = collect_settings_payload(recs)
+        assert payload == {"mtp_draft_depth": "auto"}
+        assert ids == ["mtp-use-auto"]
+
+    def test_untuned_model_yields_enable_only(self):
+        recs = build_recommendations(
+            RecommendationContext(mtp_compatible=True)
+        )
+        payload, ids = collect_settings_payload(recs)
+        assert payload == {"mtp_enabled": True}
+        assert ids == ["mtp-enable"]
+
+    def test_empty_when_nothing_actionable(self):
+        recs = build_recommendations(
+            RecommendationContext(dflash_compatible=True)
+        )
+        payload, ids = collect_settings_payload(recs)
+        assert payload == {}
+        assert ids == []
 
 
 class TestOrderingAndEmpty:

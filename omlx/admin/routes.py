@@ -2060,16 +2060,11 @@ async def load_model(
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
 
-@router.get("/api/models/{model_id}/recommendations")
-async def model_recommendations(
-    model_id: str,
-    is_admin: bool = Depends(require_admin),
-):
-    """Per-model optimization recommendations for the settings modal.
+def _build_recommendations_for(model_id: str) -> list[dict]:
+    """Gather advisor inputs for a model and run the rule engine.
 
-    Pure derivation from existing signals (compat probes, settings, the
-    quantized-MTP-head detector, the MTP tune store) — see
-    docs/experimental/model_optimization_advisor_plan.md.
+    Shared by the GET recommendations endpoint and P3 apply-all. Raises
+    HTTPException on missing pool/model.
     """
     from ..admin.mtp_tune import load_tune_entry
     from ..utils.model_loading import _mtp_weights_quantized
@@ -2111,7 +2106,81 @@ async def model_recommendations(
         ),
         mtp_tune_entry=tune_entry,
     )
-    return {"model_id": model_id, "recommendations": build_recommendations(ctx)}
+    return build_recommendations(ctx)
+
+
+@router.get("/api/models/{model_id}/recommendations")
+async def model_recommendations(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Per-model optimization recommendations for the settings modal.
+
+    Pure derivation from existing signals (compat probes, settings, the
+    quantized-MTP-head detector, the MTP tune store) — see
+    docs/experimental/model_optimization_advisor_plan.md.
+    """
+    return {
+        "model_id": model_id,
+        "recommendations": _build_recommendations_for(model_id),
+    }
+
+
+@router.post("/api/models/{model_id}/recommendations/apply-all")
+async def apply_all_recommendations(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Apply every settings-type recommendation as a profile (advisor P3).
+
+    Re-runs the rule engine server-side, merges the recommended settings
+    payloads, saves them as a profile named ``optimized-<date>`` (suffixed
+    on collision) via the profiles machinery, and applies that profile —
+    so the change is auditable and revertable in one click instead of
+    mutating base settings anonymously.
+    """
+    from ..model_profiles import InvalidProfileNameError
+    from .recommendations import collect_settings_payload
+
+    recs = _build_recommendations_for(model_id)
+    payload, rec_ids = collect_settings_payload(recs)
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail="No applicable settings recommendations for this model",
+        )
+
+    mgr = _require_settings_manager()
+    base_name = f"optimized-{time.strftime('%Y-%m-%d')}"
+    existing = {p["name"] for p in mgr.list_profiles(model_id)}
+    name = base_name
+    suffix = 2
+    while name in existing:
+        name = f"{base_name}-{suffix}"
+        suffix += 1
+
+    try:
+        profile = mgr.save_profile(
+            model_id=model_id,
+            name=name,
+            display_name=name,
+            description=(
+                "Model Optimization Advisor: " + ", ".join(rec_ids)
+            ),
+            settings=payload,
+        )
+    except (InvalidProfileNameError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    applied = mgr.apply_profile(model_id, name)
+    if applied is None:
+        raise HTTPException(status_code=500, detail="Profile vanished before apply")
+    return {
+        "model_id": model_id,
+        "profile": profile,
+        "applied_recommendations": rec_ids,
+        "settings": applied.to_dict(),
+    }
 
 
 class MtpTuneRequest(BaseModel):
