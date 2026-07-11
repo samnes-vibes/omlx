@@ -46,6 +46,8 @@
         'dflash_draft_window_size',
         'dflash_draft_sink_size',
         'dflash_verify_mode',
+        'dflash_verify_window_size',
+        'dflash_verify_sink_size',
         'mtp_enabled',
         'ngram_spec_enabled',
         'ngram_spec_min_n',
@@ -1492,6 +1494,8 @@
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
                     dflash_draft_sink_size: s.dflash_draft_sink_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
+                    dflash_verify_window_size: s.dflash_verify_window_size ?? null,
+                    dflash_verify_sink_size: s.dflash_verify_sink_size ?? null,
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
@@ -2341,6 +2345,16 @@
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
+                                dflash_verify_window_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_verify_window_size
+                                    ? parseInt(this.modelSettings.dflash_verify_window_size)
+                                    : null,
+                                dflash_verify_sink_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_verify_sink_size !== null
+                                    && this.modelSettings.dflash_verify_sink_size !== undefined
+                                    && this.modelSettings.dflash_verify_sink_size !== ''
+                                    ? parseInt(this.modelSettings.dflash_verify_sink_size)
+                                    : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 ngram_spec_enabled: !!this.modelSettings.ngram_spec_enabled,
                                 ngram_spec_min_n: this.modelSettings.ngram_spec_enabled
@@ -2411,6 +2425,8 @@
                                     dflash_draft_window_size: null,
                                     dflash_draft_sink_size: null,
                                     dflash_verify_mode: null,
+                                    dflash_verify_window_size: null,
+                                    dflash_verify_sink_size: null,
                                     mtp_enabled: false,
                                     ngram_spec_enabled: false,
                                     chunk_kv_reuse_enabled: false,
@@ -2503,6 +2519,8 @@
                         this.modelSettings.dflash_draft_window_size = null;
                         this.modelSettings.dflash_draft_sink_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
+                        this.modelSettings.dflash_verify_window_size = null;
+                        this.modelSettings.dflash_verify_sink_size = null;
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.ngram_spec_enabled = false;
                         this.modelSettings.ngram_spec_min_n = null;

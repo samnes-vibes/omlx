@@ -262,6 +262,16 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else None
         )
+        self._verify_window_size = (
+            getattr(model_settings, "dflash_verify_window_size", None)
+            if model_settings
+            else None
+        )
+        self._verify_sink_size = (
+            getattr(model_settings, "dflash_verify_sink_size", None)
+            if model_settings
+            else None
+        )
 
     @property
     def model_name(self) -> str:
@@ -365,6 +375,17 @@ class DFlashEngine(BaseEngine):
 
             install_dflash_lifecycle_wrap()
 
+            # Sink+window verify attention (long-context plan, Phase 1). No-op
+            # passthrough unless dflash_verify_window_size/sink_size are both set.
+            # Idempotent — same install-once shape as the lifecycle wrap above.
+            from ..patches.dflash_verify_window import (
+                configure_verify_window,
+                install_dflash_verify_window_patch,
+            )
+
+            install_dflash_verify_window_patch()
+            configure_verify_window(self._verify_sink_size, self._verify_window_size)
+
             target_bundle = load_target_bundle(
                 self._model_name,
                 quantize_kv_cache=bool(
@@ -464,6 +485,11 @@ class DFlashEngine(BaseEngine):
         window_used = getattr(runtime_cfg, "draft_window_size", "?")
         sink_used = getattr(runtime_cfg, "draft_sink_size", "?")
         verify_used = getattr(runtime_cfg, "verify_mode", "?")
+        verify_window_display = (
+            "off"
+            if self._verify_window_size is None or self._verify_sink_size is None
+            else f"window={self._verify_window_size},sink={self._verify_sink_size}"
+        )
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
@@ -471,7 +497,8 @@ class DFlashEngine(BaseEngine):
             f"fallback={self._fallback_engine_type}, "
             f"l1_cache={self._in_memory_cache_enabled}, "
             f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
-            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
+            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}, "
+            f"verify_window={verify_window_display}"
         )
 
     def _record_prefill_guard_active_memory(self) -> None:
@@ -551,8 +578,12 @@ class DFlashEngine(BaseEngine):
         # onto clean linear_attn / self_attn classes (issue #1388).
         try:
             from ..patches.dflash_lifecycle import restore_dflash_class_patches
+            from ..patches.dflash_verify_window import (
+                restore_dflash_verify_window_patch,
+            )
 
             restore_dflash_class_patches()
+            restore_dflash_verify_window_patch()
         except Exception as exc:
             logger.debug(f"restore_dflash_class_patches (evict): {exc}")
 
@@ -630,8 +661,12 @@ class DFlashEngine(BaseEngine):
         # clean classes instead of leftover dflash hooks (issue #1388).
         try:
             from ..patches.dflash_lifecycle import restore_dflash_class_patches
+            from ..patches.dflash_verify_window import (
+                restore_dflash_verify_window_patch,
+            )
 
             restore_dflash_class_patches()
+            restore_dflash_verify_window_patch()
         except Exception as exc:
             logger.debug(f"restore_dflash_class_patches: {exc}")
         logger.info("DFlashEngine stopped")

@@ -149,6 +149,8 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_verify_mode: str | None = None
+    dflash_verify_window_size: int | None = None
+    dflash_verify_sink_size: int | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     mtp_draft_depth: int | str | None = None
@@ -505,6 +507,8 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_draft_window_size",
         "dflash_draft_sink_size",
         "dflash_verify_mode",
+        "dflash_verify_window_size",
+        "dflash_verify_sink_size",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
     )
@@ -613,6 +617,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_draft_window_size = None
     settings.dflash_draft_sink_size = None
     settings.dflash_verify_mode = None
+    settings.dflash_verify_window_size = None
+    settings.dflash_verify_sink_size = None
     settings.mtp_enabled = False
     settings.ngram_spec_enabled = False
     settings.ngram_spec_min_n = None
@@ -2968,6 +2974,18 @@ async def update_model_settings(
         # Anything else (including empty string) → revert to dflash default.
         current_settings.dflash_verify_mode = (
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
+        )
+    if "dflash_verify_window_size" in sent:
+        # 0 / None / negative → full-context verify (unset, current behavior).
+        value = request.dflash_verify_window_size
+        current_settings.dflash_verify_window_size = (
+            int(value) if value and value > 0 else None
+        )
+    if "dflash_verify_sink_size" in sent:
+        # Negative is invalid; 0 is a legal sink-size (no sink tokens).
+        value = request.dflash_verify_sink_size
+        current_settings.dflash_verify_sink_size = (
+            int(value) if value is not None and value >= 0 else None
         )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)

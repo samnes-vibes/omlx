@@ -303,6 +303,8 @@ class EnginePool:
             add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
             add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
             add("dflash_verify_mode", data.get("dflash_verify_mode"))
+            add("dflash_verify_window_size", data.get("dflash_verify_window_size"))
+            add("dflash_verify_sink_size", data.get("dflash_verify_sink_size"))
 
         vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
             "vlm_mtp_draft_model"

@@ -88,6 +88,14 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
+        dflash_verify_window_size: Trailing-window size (tokens) the verify forward
+            attends to, paired with dflash_verify_sink_size (None in either = full
+            verify, unchanged behavior). Keeps DFlash's speedup active past
+            dflash_max_ctx instead of falling back to BatchedEngine. Approximate:
+            verify acceptance is computed against a windowed view of the target
+            distribution, not the full context.
+        dflash_verify_sink_size: Attention-sink prefix size (tokens) always kept in the
+            verify forward regardless of window, paired with dflash_verify_window_size.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -222,6 +230,14 @@ class ModelSettings:
     dflash_draft_window_size: Optional[int] = None
     dflash_draft_sink_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    # Sink+window attention for the *verify* forward (long-context plan). None (either
+    # value) = full-context verify, today's behavior. When both are set, the verify
+    # pass attends only to the first dflash_verify_sink_size tokens plus the last
+    # dflash_verify_window_size tokens instead of the whole target KV cache, so verify
+    # cost stops growing with context. Approximate (windowed) acceptance decisions —
+    # opt-in, see docs/experimental/dflash2_long_context_plan.md.
+    dflash_verify_window_size: Optional[int] = None
+    dflash_verify_sink_size: Optional[int] = None
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.

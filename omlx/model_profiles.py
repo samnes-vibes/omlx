@@ -61,6 +61,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
     "dflash_verify_mode",
+    "dflash_verify_window_size",
+    "dflash_verify_sink_size",
     "mtp_enabled",
     "mtp_draft_depth",
     "ngram_spec_enabled",
