@@ -213,6 +213,44 @@ Next: plan step 4 — measure depth 1/2/3/4 on real checkpoints via
 record in [speedup_results_tracker.md](speedup_results_tracker.md); go/no-go
 for Phase 2 auto-tune. Blocked on hardware as of 2026-07-09 (see Status).
 
+**Step 4 measured (2026-07-11, Qwen 27B, `integration/bench-all` rig):**
+
+| scenario | d1 | d2 | d3 | d4 | best |
+|---|---|---|---|---|---|
+| agent_loop | 15.5 | 15.6 | 15.5 | 15.5 | d2, 1.00x |
+| code_edit | 20.2 | 20.1 | 20.1 | 20.2 | d1, 1.00x |
+| freeform | 21.2 | 21.4 | 21.3 | 21.2 | d2, 1.01x |
+| **long_context** | **7.2** | **8.5** | 8.4 | 8.4 | **d2, 1.18x** |
+| multi_turn_edit | 16.6 | 16.5 | 16.6 | 16.6 | d3, 1.00x |
+| prefix_control | 17.4 | 17.4 | 17.4 | 17.3 | d1, 1.00x |
+| rag | 17.1 | 17.1 | 16.9 | 17.1 | d2, 1.00x |
+| rag_permuted | 20.3 | 20.3 | 20.0 | 20.2 | d1, 1.00x |
+| summarize | 17.4 | 17.4 | 17.3 | 17.3 | d2, 1.00x |
+
+**Reading:** depth has essentially no effect (±1%, noise) on every
+short/medium scenario — matches the mirror-sd P0.1 finding on this same
+rig that draft-time is only ~5-6% of cycle time (compute-bound verify
+dominates), so chaining more draft steps has nothing to hide behind.
+The one real signal is **long_context: +18% at depth 2**, flat beyond
+that (d3/d4 ≈ d2). Hypothesis: at long context the *bonus* token from a
+2-deep chain amortizes the now-larger verify-forward cost better than a
+1-deep chain does, but a 3rd/4th chained draft adds verify cost without
+enough extra acceptance to pay for itself here.
+
+**Go/no-go for Phase 2 auto-tune:** **go, but scoped down.** The tuner is
+worth keeping (a scenario-blind sweep like this can't tell code_edit's
+flat d1 from long_context's d2 win — an operator with mostly-long-context
+traffic needs the per-machine "auto" resolution this phase already
+ships), but the *default* recommendation logic should not chase depth 3-4
+on this hardware class: pin the advisor's tune sweep to depths {0,1,2}
+by default here, only extending to 3-4 when the tune-store shows d2 still
+climbing. Also worth cross-checking against DFlash on the same
+long_context scenario — see
+[dflash2_long_context_plan.md](dflash2_long_context_plan.md); MTP's win
+here is capped by the same full-context verify cost that plan targets,
+so DFlash's windowed verify (once implemented) is the more structural fix
+for this specific scenario.
+
 ## Phase 3 implementation notes (2026-07-09)
 
 Landed on `feat/mtp-multi-depth` alongside benchmark plumbing. Deltas vs

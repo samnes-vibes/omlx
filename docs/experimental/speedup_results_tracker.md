@@ -40,6 +40,7 @@ upstream merge that touches the hot path):
 | Config | Decode tok/s (freeform) | Prefill tok/s @8K | TTFT @8K | Date / commit |
 |---|---|---|---|---|
 | REF-8GB | 104.2 (spec_bench freeform, off-arm, 2026-07-05) | — | — | b499b7e |
+| REF-BIG | 21.2 (perf_bench freeform, MTP depth 1, 2026-07-11) | — | — | integration/bench-all @ 4c4f013 |
 | REF-BIG | — | — | — | — |
 
 ---
@@ -129,6 +130,32 @@ kill-gate measurements to its plan doc; mirror only the verdict line here:
 | A4 ANE draft pipeline | — | — | — | — |
 | B3 ANE prefill | — | — | — | — |
 | A5 dLLM engine | — | — | — | — |
+
+### 7. Multi-depth MTP — `feat/mtp-multi-depth` — **measured (partial)**
+
+Source: [mtplx_adoption_plan.md](mtplx_adoption_plan.md) "Step 4 measured";
+`scripts/perf_bench.py --setting-key mtp_draft_depth --sweep-values 1,2,3,4`,
+REF-BIG, Qwen 27B, 2026-07-11.
+
+| Scenario | d1 tok/s | Best depth | Speedup |
+|---|---|---|---|
+| agent_loop | 15.5 | d2 | 1.00x |
+| code_edit | 20.2 | d1 | 1.00x |
+| freeform | 21.2 | d2 | 1.01x |
+| long_context | 7.2 | d2 | **1.18x** |
+| multi_turn_edit | 16.6 | d3 | 1.00x |
+| prefix_control | 17.4 | d1 | 1.00x |
+| rag | 17.1 | d2 | 1.00x |
+| rag_permuted | 20.3 | d1 | 1.00x |
+| summarize | 17.4 | d2 | 1.00x |
+
+Depth is flat (noise-level) everywhere except long_context, where depth 2
+gives a real 18% gain and depth 3-4 add nothing further. Consistent with
+the mirror-sd P0.1 finding on this same rig that draft time is only
+~5-6% of cycle time — deeper chains have little slack to exploit outside
+the regime where verify cost itself is already large (long context).
+DFlash long-context comparison on the same scenario is the open item —
+see item 3 below.
 
 ---
 
