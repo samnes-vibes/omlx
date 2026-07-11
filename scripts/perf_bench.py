@@ -408,6 +408,125 @@ def run_scenario(base_url, model, name, runs, warmup, token=None, cache_bust=Fal
     }
 
 
+def _context_prompt(n_tokens):
+    """Deterministic filler prompt of roughly ``n_tokens`` tokens.
+
+    Reuses the aperiodic long-document generator (~0.75 words/token is a
+    close enough English heuristic for context *points*, not exact counts)
+    plus a fixed question that forces a real completion.
+    """
+    doc = _long_context_doc(approx_words=max(int(n_tokens * 0.72), 16))
+    return [
+        {
+            "role": "user",
+            "content": "Context:\n" + doc + "\n\nSummarize the recurring "
+            "themes of the sections above in a few sentences.",
+        }
+    ]
+
+
+_SPEC_STATS_PATH = "admin/api/spec-decode/stats"
+
+
+def _spec_row(path_name, totals, tok_s):
+    """Distill one path's cumulative counters into a table row dict."""
+    cycles = totals.get("cycles", 0)
+    row = {"path": path_name, "tok_s": tok_s, "cycles": cycles}
+    if path_name == "mtp":
+        drafts = totals.get("draft_tokens", 0)
+        row["alpha"] = totals.get("accepted_drafts", 0) / cycles if cycles else None
+        row["accept_rate"] = (
+            totals.get("accepted_drafts", 0) / drafts if drafts else None
+        )
+        row["draft_ms"] = totals.get("draft_ms", 0.0) / cycles if cycles else None
+        row["verify_ms"] = totals.get("verify_ms", 0.0) / cycles if cycles else None
+    elif path_name == "ngram":
+        proposed = totals.get("proposed_tokens", 0)
+        row["alpha"] = totals.get("accepted_tokens", 0) / cycles if cycles else None
+        row["accept_rate"] = (
+            totals.get("accepted_tokens", 0) / proposed if proposed else None
+        )
+        row["draft_ms"] = totals.get("propose_ms", 0.0) / cycles if cycles else None
+        row["verify_ms"] = totals.get("backbone_ms", 0.0) / cycles if cycles else None
+    elif path_name == "dflash":
+        row["alpha"] = None
+        row["accept_rate"] = (
+            totals.get("acceptance_weighted", 0.0) / cycles if cycles else None
+        )
+        row["draft_ms"] = None  # loop lives inside dflash_mlx; not visible
+        row["verify_ms"] = None
+    return row
+
+
+def _fmt(v, pct=False):
+    if v is None:
+        return "-"
+    return f"{v * 100:.1f}%" if pct else f"{v:.2f}"
+
+
+def run_spec_breakdown(args, token):
+    """mirror-sd P0.1: per-context-point speculation breakdown table.
+
+    For each context point: reset the cumulative spec counters, run the
+    measured completions, then read back /admin/api/spec-decode/stats and
+    report per-cycle draft/verify time and acceptance alongside tok/s.
+    Whichever speculative path was active shows up with cycles > 0; rows
+    for idle paths are skipped.
+    """
+    contexts = [int(c) for c in args.contexts.split(",")]
+    results = {}
+    for ctx_len in contexts:
+        print(f"== context {ctx_len} ==", flush=True)
+        messages = _context_prompt(ctx_len)
+        for _ in range(args.warmup):
+            run_streaming_completion(
+                args.base_url, args.model, messages, args.max_tokens,
+                token=token, cache_bust=args.cache_bust,
+            )
+        fetch_stats(args.base_url, _SPEC_STATS_PATH, token=token, reset=True)
+        rates = []
+        for i in range(args.runs):
+            ttft, decode_s, n = run_streaming_completion(
+                args.base_url, args.model, messages, args.max_tokens,
+                token=token, cache_bust=args.cache_bust,
+            )
+            rates.append(n / decode_s)
+            print(
+                f"    run {i + 1}/{args.runs}: {n} tok, "
+                f"ttft {ttft * 1000:.0f} ms, {n / decode_s:.1f} tok/s",
+                flush=True,
+            )
+        tok_s = statistics.median(rates)
+        totals = fetch_stats(args.base_url, _SPEC_STATS_PATH, token=token)
+        rows = [
+            _spec_row(name, path_totals, tok_s)
+            for name, path_totals in (totals or {}).items()
+            if isinstance(path_totals, dict) and path_totals.get("cycles")
+        ]
+        results[ctx_len] = rows or [
+            {"path": "none", "tok_s": tok_s, "cycles": 0, "alpha": None,
+             "accept_rate": None, "draft_ms": None, "verify_ms": None}
+        ]
+
+    print()
+    print(
+        f"{'context':>8} {'path':<7} {'tok/s':>8} {'alpha':>7} "
+        f"{'accept':>8} {'draft ms/cyc':>13} {'verify ms/cyc':>14}"
+    )
+    for ctx_len, rows in results.items():
+        for row in rows:
+            print(
+                f"{ctx_len:>8} {row['path']:<7} {row['tok_s']:>8.1f} "
+                f"{_fmt(row.get('alpha')):>7} "
+                f"{_fmt(row.get('accept_rate'), pct=True):>8} "
+                f"{_fmt(row.get('draft_ms')):>13} "
+                f"{_fmt(row.get('verify_ms')):>14}"
+            )
+    if args.json:
+        print(json.dumps({str(k): v for k, v in results.items()}, indent=2))
+    return 0
+
+
 def fetch_stats(base_url, stats_path, token=None, reset=False):
     try:
         sep = "&" if "?" in stats_path else "?"
@@ -516,6 +635,25 @@ def main():
         "(default: ngram_spec_enabled)",
     )
     ap.add_argument(
+        "--spec-breakdown",
+        action="store_true",
+        help="mirror-sd P0.1: per-context-point speculation breakdown "
+        "(tok/s, alpha, accept rate, draft/verify ms per cycle) for the "
+        "currently active speculative path",
+    )
+    ap.add_argument(
+        "--contexts",
+        default="64,512,2048,4096",
+        help="comma-separated context points (approx prompt tokens) for "
+        "--spec-breakdown (default: 64,512,2048,4096)",
+    )
+    ap.add_argument(
+        "--max-tokens",
+        type=int,
+        default=128,
+        help="completion length per --spec-breakdown run (default: 128)",
+    )
+    ap.add_argument(
         "--sweep-values",
         default=None,
         help=(
@@ -549,6 +687,9 @@ def main():
     except urllib.error.URLError as e:
         print(f"error: server not reachable at {args.base_url}: {e}", file=sys.stderr)
         return 1
+
+    if args.spec_breakdown:
+        return run_spec_breakdown(args, token)
 
     if args.sweep_values:
         values = [json.loads(v) for v in args.sweep_values.split(",")]

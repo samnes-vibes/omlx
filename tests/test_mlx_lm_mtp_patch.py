@@ -2324,3 +2324,57 @@ class TestMtpRuntimeStatus:
         status = mtp_runtime_status(model)
         assert status["auto_disabled"] is True
         assert status["auto_disabled_reason"]
+
+
+class TestMtpSpecTotals:
+    """mirror-sd P0.1: cumulative MTP counters behind the stats endpoint."""
+
+    def _stats(self, **kw):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _MtpStats
+
+        s = _MtpStats()
+        for k, v in kw.items():
+            setattr(s, k, v)
+        return s
+
+    def test_accumulates_and_resets(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _accumulate_mtp_totals,
+            get_mtp_spec_totals,
+        )
+
+        get_mtp_spec_totals(reset=True)
+        _accumulate_mtp_totals(
+            self._stats(
+                cycles=10, accepts=6, draft_tokens=20, accepted_drafts=15,
+                draft_emits=15, bonus_emits=6, verify_emits=4, init_emits=2,
+                backbone_ms=100.0, mtp_head_ms=30.0,
+            )
+        )
+        _accumulate_mtp_totals(
+            self._stats(
+                cycles=5, accepts=2, draft_tokens=10, accepted_drafts=5,
+                backbone_ms=50.0, mtp_head_ms=20.0,
+            )
+        )
+        t = get_mtp_spec_totals()
+        assert t["requests"] == 2
+        assert t["cycles"] == 15
+        assert t["draft_tokens"] == 30
+        assert t["accepted_drafts"] == 20
+        assert t["verify_ms"] == 150.0
+        assert t["draft_ms"] == 50.0
+        assert t["tokens"] == 27
+        # reset clears
+        assert get_mtp_spec_totals(reset=True)["requests"] == 2
+        assert get_mtp_spec_totals() == {}
+
+    def test_log_funnel_accumulates(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _log_mtp_stats,
+            get_mtp_spec_totals,
+        )
+
+        get_mtp_spec_totals(reset=True)
+        _log_mtp_stats("uid-1", self._stats(cycles=3, draft_tokens=6), "stop")
+        assert get_mtp_spec_totals()["cycles"] == 3

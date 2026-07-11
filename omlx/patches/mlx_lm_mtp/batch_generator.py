@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -1517,6 +1518,41 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
 
+# Cumulative process-level MTP counters for the admin stats endpoint /
+# perf_bench --spec-breakdown (mirror-sd P0.1). Accumulated in
+# _log_mtp_stats — the single funnel every finished MTP sequence passes
+# through — so per-sequence and cumulative views can't drift apart.
+_MTP_TOTALS: dict[str, float] = {}
+_MTP_TOTALS_LOCK = threading.Lock()
+
+
+def _accumulate_mtp_totals(stats: "_MtpStats") -> None:
+    emits = (
+        stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
+    )
+    with _MTP_TOTALS_LOCK:
+        t = _MTP_TOTALS
+        t["requests"] = t.get("requests", 0) + 1
+        t["tokens"] = t.get("tokens", 0) + emits
+        t["cycles"] = t.get("cycles", 0) + stats.cycles
+        t["full_accept_cycles"] = t.get("full_accept_cycles", 0) + stats.accepts
+        t["draft_tokens"] = t.get("draft_tokens", 0) + stats.draft_tokens
+        t["accepted_drafts"] = t.get("accepted_drafts", 0) + stats.accepted_drafts
+        t["verify_ms"] = t.get("verify_ms", 0.0) + stats.backbone_ms
+        t["draft_ms"] = t.get("draft_ms", 0.0) + stats.mtp_head_ms
+        t["sample_ms"] = t.get("sample_ms", 0.0) + stats.sample_ms
+        t["cache_ops_ms"] = t.get("cache_ops_ms", 0.0) + stats.cache_ops_ms
+
+
+def get_mtp_spec_totals(reset: bool = False) -> dict[str, float]:
+    """Cumulative MTP draft/verify counters (admin stats / benchmarks)."""
+    with _MTP_TOTALS_LOCK:
+        snapshot = dict(_MTP_TOTALS)
+        if reset:
+            _MTP_TOTALS.clear()
+    return snapshot
+
+
 def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
     """Emit a one-line summary of MTP draft/verify activity for a finished sequence.
 
@@ -1526,6 +1562,7 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         emits[init=<i>,draft=<d>,bonus=<b>,verify=<v>]
         timing[backbone=<X>ms mtp=<Y>ms sample=<S>ms cache=<C>ms]
     """
+    _accumulate_mtp_totals(stats)
     total_emits = (
         stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
     )

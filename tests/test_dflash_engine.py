@@ -1157,3 +1157,26 @@ class TestDFlashCachedTokensWiring:
 
         out = await engine.generate("hello", max_tokens=4)
         assert out.cached_tokens == 4273
+
+
+class TestDflashSpecTotals:
+    """mirror-sd P0.1: cumulative DFlash counters behind the stats endpoint."""
+
+    def test_accumulates_weighted_acceptance_and_resets(self):
+        from omlx.engine.dflash import (
+            _accumulate_dflash_totals,
+            get_dflash_spec_totals,
+        )
+
+        get_dflash_spec_totals(reset=True)
+        _accumulate_dflash_totals(100, 0.8, 20, 2_000_000, False)
+        _accumulate_dflash_totals(50, 0.5, 10, 1_000_000, True)
+        t = get_dflash_spec_totals()
+        assert t["requests"] == 2
+        assert t["tokens"] == 150
+        assert t["cycles"] == 30
+        assert t["acceptance_weighted"] == 0.8 * 20 + 0.5 * 10
+        assert t["elapsed_ms"] == 3000.0
+        assert t["fallback_requests"] == 1
+        get_dflash_spec_totals(reset=True)
+        assert get_dflash_spec_totals() == {}

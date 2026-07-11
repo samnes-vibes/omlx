@@ -1768,6 +1768,34 @@ async def get_ngram_spec_stats(
     return {"totals": get_ngram_spec_totals(reset=reset)}
 
 
+@router.get("/api/spec-decode/stats")
+async def get_spec_decode_stats(
+    reset: bool = False, is_admin: bool = Depends(require_admin)
+):
+    """Cumulative speculative-decoding counters for every path (mirror-sd P0.1).
+
+    ``mtp`` carries the full draft/verify wall-time split
+    (``draft_ms`` = MTP-head forwards, ``verify_ms`` = backbone verify
+    forwards, plus ``sample_ms`` / ``cache_ops_ms``) and acceptance counts;
+    ``ngram`` the same shape from the n-gram path; ``dflash`` acceptance +
+    cycles only (its loop runs inside the external dflash_mlx runtime, so
+    no per-phase timings are visible from here). Summed since server start
+    or the last ``?reset=true`` — used by
+    ``scripts/perf_bench.py --spec-breakdown``.
+    """
+    from ..engine.dflash import get_dflash_spec_totals
+    from ..patches.mlx_lm_mtp.batch_generator import get_mtp_spec_totals
+    from ..patches.ngram_spec import get_ngram_spec_totals
+
+    return {
+        "totals": {
+            "mtp": get_mtp_spec_totals(reset=reset),
+            "dflash": get_dflash_spec_totals(reset=reset),
+            "ngram": get_ngram_spec_totals(reset=reset),
+        }
+    }
+
+
 @router.get("/api/kv-reuse/stats")
 async def get_kv_reuse_stats(
     reset: bool = False, is_admin: bool = Depends(require_admin)

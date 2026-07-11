@@ -53,6 +53,23 @@ suoraan että pullonkaula on FFN-kaista. Sama diagnostiikka meille:
 DFlash- ja MTP-moodeille; tulos liitetään dflash2-suunnitelman Phase 1
 -mittaukseen (Design A vs B -päätös).
 
+**Toteutettu (2026-07-11, `integration/bench-all`):**
+`scripts/perf_bench.py --spec-breakdown [--contexts 64,512,2048,4096]`
+tulostaa per kontekstipiste: tok/s, α (hyväksytyt draftit / cycle),
+accept-rate, draft_ms/cycle, verify_ms/cycle. Datalähde: uusi
+`GET /admin/api/spec-decode/stats?reset=true`, joka niputtaa kumulatiiviset
+laskurit kaikilta poluilta: **MTP** (uusi `get_mtp_spec_totals` —
+`_MtpStats` keräsi jo ajastukset per sequence, aggregointi lisättiin
+`_log_mtp_stats`-suppiloon, ei uutta overheadia), **ngram** (olemassa
+ollut `get_ngram_spec_totals`) ja **DFlash** (uusi
+`get_dflash_spec_totals` SummaryEventeistä — huom: DFlashin
+draft/verify-aikajako ei ole näkyvissä, koska looppi pyörii ulkoisessa
+dflash_mlx-runtimessa; DFlash-rivillä on α ja cycles, ei ms-jakoa).
+Kontekstipisteprompti on deterministinen `_long_context_doc`-pohjainen
+täyte. P0.2-tarkistuslista on tämän dokumentin yllä olevassa osiossa;
+linkki fused_int4_attention_plan.md:stä lisätään erikseen (tiedostossa
+on työn alla olevia muokkauksia).
+
 ### P0.2 Kernel-precision-tarkistuslista
 
 mirror-sd:n Phase 2 -sudenkuopat + omat fused-int4-oppimme yhteen paikkaan.

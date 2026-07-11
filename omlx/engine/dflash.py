@@ -73,6 +73,41 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     return True, ""
 
 
+# Cumulative process-level DFlash speculation counters for the admin stats
+# endpoint / perf_bench --spec-breakdown (mirror-sd P0.1). Accumulated from
+# each generation's SummaryEvent. Draft/verify wall-time split is not
+# available here — the loop runs inside the external dflash_mlx runtime —
+# so acceptance and cycle counts are the breakdown DFlash can offer.
+_DFLASH_TOTALS: dict[str, float] = {}
+_DFLASH_TOTALS_LOCK = threading.Lock()
+
+
+def _accumulate_dflash_totals(
+    gen_tokens: int, accept_ratio: float, cycles: int, elapsed_us: int, fallback: bool
+) -> None:
+    with _DFLASH_TOTALS_LOCK:
+        t = _DFLASH_TOTALS
+        t["requests"] = t.get("requests", 0) + 1
+        t["tokens"] = t.get("tokens", 0) + gen_tokens
+        t["cycles"] = t.get("cycles", 0) + cycles
+        # Weighted by cycles so multi-request averages don't skew short runs.
+        t["acceptance_weighted"] = (
+            t.get("acceptance_weighted", 0.0) + accept_ratio * cycles
+        )
+        t["elapsed_ms"] = t.get("elapsed_ms", 0.0) + elapsed_us / 1000.0
+        if fallback:
+            t["fallback_requests"] = t.get("fallback_requests", 0) + 1
+
+
+def get_dflash_spec_totals(reset: bool = False) -> dict[str, float]:
+    """Cumulative DFlash speculation counters (admin stats / benchmarks)."""
+    with _DFLASH_TOTALS_LOCK:
+        snapshot = dict(_DFLASH_TOTALS)
+        if reset:
+            _DFLASH_TOTALS.clear()
+    return snapshot
+
+
 class _DFlashPrefillGuard:
     """Prefill-memory guard target for DFlash's primary (speculative) path,
     which bypasses the Scheduler entirely.
@@ -1020,6 +1055,9 @@ class DFlashEngine(BaseEngine):
                     elapsed_s = elapsed_us / 1e6 if elapsed_us else 0
                     gen_tps = gen_tokens / elapsed_s if elapsed_s > 0 else 0
                     fallback = bool(event.fallback_ar)
+                    _accumulate_dflash_totals(
+                        gen_tokens, accept_ratio, cycles, elapsed_us, fallback
+                    )
                     logger.info(
                         f"DFlash generation complete: "
                         f"{gen_tokens} tokens, "
