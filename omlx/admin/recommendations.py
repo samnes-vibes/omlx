@@ -36,6 +36,9 @@ _SEVERITY_ORDER = {"warn": 0, "suggest": 1, "info": 2}
 _HEURISTIC_GAIN = {
     "mtp-enable": "high",
     "dflash-candidate": "medium",
+    "ngram-spec-enable": "medium",
+    "sparse-prefill-enable": "medium",
+    "chunk-kv-reuse-candidate": "low",
 }
 _GAIN_CLASS_RANK = {"high": 0, "medium": 1, "low": 2}
 
@@ -63,10 +66,23 @@ class RecommendationContext:
     # (hash-filtered by the endpoint), keyed by rec id. Shape per entry:
     # {"gain_pct", "variants", "trial_at", "settings_hash", ...}.
     ab_trial_results: dict[str, dict] | None = None
+    # Integration-branch features (ngram spec, CacheBlend chunk-KV reuse,
+    # draft-free sparse prefill) — rules added alongside the feature merge.
+    ngram_spec_enabled: bool = False
+    chunk_kv_reuse_enabled: bool = False
+    sparse_prefill_enabled: bool = False
+    # Whether a sparse-prefill calibration file exists for this model on
+    # this machine (enabling without one leaves prefill dense).
+    sparse_prefill_calibrated: bool = False
 
 
 def _any_speculative_on(ctx: RecommendationContext) -> bool:
-    return ctx.mtp_enabled or ctx.dflash_enabled or ctx.vlm_mtp_enabled
+    return (
+        ctx.mtp_enabled
+        or ctx.dflash_enabled
+        or ctx.vlm_mtp_enabled
+        or ctx.ngram_spec_enabled
+    )
 
 
 def _tune_measurement(ctx: RecommendationContext) -> dict | None:
@@ -188,6 +204,7 @@ def build_recommendations(ctx: RecommendationContext) -> list[dict]:
         and not ctx.mtp_enabled
         and not ctx.dflash_enabled
         and not ctx.vlm_mtp_enabled
+        and not ctx.ngram_spec_enabled
         and not ctx.turboquant_kv_enabled
     ):
         recs.append(
@@ -324,6 +341,100 @@ def build_recommendations(ctx: RecommendationContext) -> list[dict]:
                     "the DFlash section below to try it."
                 ),
                 "action": None,
+            }
+        )
+
+    # N-gram / prompt-lookup speculation: draft-model-free, one click. Only
+    # offered when native MTP isn't an option for this checkpoint (MTP wins
+    # when available) and no other speculative path is on — the paths are
+    # mutually exclusive in settings validation.
+    if not ctx.mtp_compatible and not _any_speculative_on(ctx):
+        recs.append(
+            {
+                "id": "ngram-spec-enable",
+                "severity": "suggest",
+                "title": "Enable n-gram speculative decoding",
+                "detail": (
+                    "This checkpoint has no usable MTP heads, but n-gram / "
+                    "prompt-lookup speculation needs no draft model: drafts "
+                    "come from the request's own tokens and are verified by "
+                    "the model, so output is unchanged. Strongest on "
+                    "echo-heavy workloads (summarization, code edits, RAG); "
+                    "roughly neutral on freeform prose."
+                ),
+                "action": {
+                    "type": "settings",
+                    "payload": {"ngram_spec_enabled": True},
+                },
+            }
+        )
+
+    # Draft-free sparse prefill: needs an offline calibration file — enabling
+    # it without one leaves prefill dense, so the rule only offers the flag
+    # once calibration exists, and otherwise explains how to produce it.
+    if not ctx.sparse_prefill_enabled and not ctx.specprefill_enabled:
+        if ctx.sparse_prefill_calibrated:
+            recs.append(
+                {
+                    "id": "sparse-prefill-enable",
+                    "severity": "suggest",
+                    "title": "Enable sparse prefill (calibration found)",
+                    "detail": (
+                        "A sparse-prefill calibration file exists for this "
+                        "model on this machine. Enabling it applies "
+                        "calibrated per-head sparse attention to long "
+                        "prefills (≥8K tokens by default), cutting "
+                        "time-to-first-token without dropping tokens; decode "
+                        "is untouched."
+                    ),
+                    "action": {
+                        "type": "settings",
+                        "payload": {"sparse_prefill_enabled": True},
+                    },
+                }
+            )
+        else:
+            recs.append(
+                {
+                    "id": "sparse-prefill-calibrate",
+                    "severity": "info",
+                    "title": "Sparse prefill available after calibration",
+                    "detail": (
+                        "Draft-free sparse prefill can cut long-prompt "
+                        "time-to-first-token, but this model has no "
+                        "calibration file on this machine yet. Run "
+                        "`python -m omlx.sparse_calibration --model "
+                        "<model>` once, then enable "
+                        "sparse_prefill_enabled."
+                    ),
+                    "action": None,
+                }
+            )
+
+    # CacheBlend chunk-KV reuse: prefill-side, workload-dependent (helps
+    # RAG/agent prompts that repeat content at shifted positions), and
+    # incompatible with DFlash and TurboQuant KV.
+    if (
+        not ctx.chunk_kv_reuse_enabled
+        and not ctx.dflash_enabled
+        and not ctx.turboquant_kv_enabled
+    ):
+        recs.append(
+            {
+                "id": "chunk-kv-reuse-candidate",
+                "severity": "info",
+                "title": "Chunk KV reuse for repeated-content prompts",
+                "detail": (
+                    "CacheBlend-style chunk KV reuse (experimental) reuses "
+                    "precomputed KV for prompt chunks even when they move "
+                    "position, cutting prefill on RAG and agent-loop "
+                    "workloads that repeat content at shifted offsets. "
+                    "Neutral for prompts without repeated chunks."
+                ),
+                "action": {
+                    "type": "settings",
+                    "payload": {"chunk_kv_reuse_enabled": True},
+                },
             }
         )
 

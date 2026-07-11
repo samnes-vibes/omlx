@@ -32,7 +32,10 @@ class TestMatrixShape:
             "mtp",
             "dflash",
             "vlm_mtp",
+            "ngram_spec",
             "specprefill",
+            "sparse_prefill",
+            "chunk_kv_reuse",
             "turboquant_kv",
         ]
         for c in caps:
@@ -239,3 +242,62 @@ class TestTurboquantCapability:
         )
         ctx = CapabilityContext(turboquant_kv_enabled=True)
         assert _cap(build_capabilities(ctx), "turboquant_kv")["status"] == "active"
+
+
+class TestIntegrationFeatureCapabilities:
+    """Capability rows for ngram spec, sparse prefill and chunk-KV reuse."""
+
+    def test_ngram_available_by_default_and_active_when_on(self):
+        assert _cap(build_capabilities(CapabilityContext()), "ngram_spec")[
+            "status"
+        ] == "available"
+        ctx = CapabilityContext(ngram_spec_enabled=True)
+        assert _cap(build_capabilities(ctx), "ngram_spec")["status"] == "active"
+
+    def test_ngram_mutex_note_when_other_spec_active(self):
+        ctx = CapabilityContext(mtp_enabled=True)
+        cap = _cap(build_capabilities(ctx), "ngram_spec")
+        assert cap["status"] == "available"
+        assert "mutually exclusive" in cap["reason"]
+
+    def test_chunk_kv_reuse_statuses(self):
+        assert _cap(build_capabilities(CapabilityContext()), "chunk_kv_reuse")[
+            "status"
+        ] == "available"
+        ctx = CapabilityContext(chunk_kv_reuse_enabled=True)
+        assert _cap(build_capabilities(ctx), "chunk_kv_reuse")["status"] == "active"
+        ctx = CapabilityContext(dflash_enabled=True)
+        cap = _cap(build_capabilities(ctx), "chunk_kv_reuse")
+        assert cap["status"] == "available"
+        assert "incompatible" in cap["reason"]
+
+    def test_sparse_prefill_needs_calibration(self):
+        cap = _cap(
+            build_capabilities(
+                CapabilityContext(
+                    sparse_prefill_calibration_path="/tmp/x/calib.json"
+                )
+            ),
+            "sparse_prefill",
+        )
+        assert cap["status"] == "needs-config"
+        assert "sparse_calibration" in cap["reason"]
+        assert cap["catalog"] == ["expected calibration: /tmp/x/calib.json"]
+
+    def test_sparse_prefill_available_when_calibrated_active_when_on(self):
+        ctx = CapabilityContext(sparse_prefill_calibrated=True)
+        assert _cap(build_capabilities(ctx), "sparse_prefill")["status"] == "available"
+        ctx = CapabilityContext(
+            sparse_prefill_enabled=True, sparse_prefill_calibrated=True
+        )
+        assert _cap(build_capabilities(ctx), "sparse_prefill")["status"] == "active"
+
+    def test_sparse_prefill_enabled_without_calibration_is_needs_config(self):
+        ctx = CapabilityContext(sparse_prefill_enabled=True)
+        assert _cap(build_capabilities(ctx), "sparse_prefill")["status"] == "needs-config"
+
+    def test_sparse_prefill_mutex_with_specprefill(self):
+        ctx = CapabilityContext(specprefill_enabled=True)
+        cap = _cap(build_capabilities(ctx), "sparse_prefill")
+        assert cap["status"] == "available"
+        assert "SpecPrefill" in cap["reason"]

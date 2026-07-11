@@ -138,6 +138,19 @@ Branch-only features (ngram, CacheBlend, sparse prefill draft-free)
 stay out of the advisor until merged — the rule gets added in the same
 PR as the feature flag (new working rule).
 
+**Update (2026-07-11, `integration/bench-all`):** those three features are
+now merged into the integration branch, and their rules + capability rows
+landed with the merge: `ngram-spec-enable` (suggest; only when the
+checkpoint has no usable MTP and no speculative path is on),
+`sparse-prefill-enable` / `sparse-prefill-calibrate` (suggest with a
+one-click action when a calibration file exists for this model on this
+machine, otherwise an advice-only info pointing at
+`python -m omlx.sparse_calibration`), and `chunk-kv-reuse-candidate`
+(info; suppressed by DFlash/TurboQuant mutexes). Capability matrix gained
+`ngram_spec`, `sparse_prefill` (with calibration-path hint) and
+`chunk_kv_reuse` rows. All three enable-rules carry settings actions, so
+the P2b A/B trial button covers them directly.
+
 ### Phase 4 — capability matrix: "what can this model do and why not" (proposed)
 
 Problem: MTP compatibility is two-part — (1) the config declares MTP heads

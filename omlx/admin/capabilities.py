@@ -64,6 +64,12 @@ class CapabilityContext:
     specprefill_enabled: bool = False
     specprefill_draft_model: str | None = None
     turboquant_kv_enabled: bool = False
+    # Integration-branch features
+    ngram_spec_enabled: bool = False
+    chunk_kv_reuse_enabled: bool = False
+    sparse_prefill_enabled: bool = False
+    sparse_prefill_calibrated: bool = False
+    sparse_prefill_calibration_path: str | None = None
     # Live runtime state (Phase 5), only populated when the model is
     # loaded — None fields mean "not loaded" / "not applicable" rather
     # than a specific value.
@@ -307,12 +313,115 @@ def _turboquant_capability(ctx: CapabilityContext) -> dict:
     )
 
 
+def _ngram_spec_capability(ctx: CapabilityContext) -> dict:
+    label = "N-gram Speculation"
+    if ctx.ngram_spec_enabled:
+        return _cap("ngram_spec", label, "active", "Enabled.")
+    other_spec = ctx.mtp_enabled or ctx.dflash_enabled or ctx.vlm_mtp_enabled
+    if other_spec:
+        return _cap(
+            "ngram_spec",
+            label,
+            "available",
+            "Available, but mutually exclusive with the active speculative "
+            "path — enabling it requires turning that off first.",
+        )
+    return _cap(
+        "ngram_spec",
+        label,
+        "available",
+        "Draft-model-free speculation from the request's own tokens; "
+        "works on any architecture with a rollback-capable cache. Best on "
+        "echo-heavy workloads (summarization, code edits, RAG).",
+    )
+
+
+def _chunk_kv_reuse_capability(ctx: CapabilityContext) -> dict:
+    label = "Chunk KV Reuse"
+    if ctx.chunk_kv_reuse_enabled:
+        return _cap("chunk_kv_reuse", label, "active", "Enabled.")
+    if ctx.dflash_enabled or ctx.turboquant_kv_enabled:
+        return _cap(
+            "chunk_kv_reuse",
+            label,
+            "available",
+            "Available, but incompatible with DFlash and TurboQuant KV — "
+            "enabling it requires turning those off first.",
+        )
+    return _cap(
+        "chunk_kv_reuse",
+        label,
+        "available",
+        "CacheBlend-style non-prefix KV reuse (experimental): reuses "
+        "precomputed chunk KV at shifted prompt positions. Helps RAG and "
+        "agent-loop prompts that repeat content.",
+    )
+
+
+def _sparse_prefill_capability(ctx: CapabilityContext) -> dict:
+    label = "Sparse Prefill"
+    if ctx.sparse_prefill_enabled and ctx.sparse_prefill_calibrated:
+        return _cap(
+            "sparse_prefill",
+            label,
+            "active",
+            "Enabled with a calibration file; long prefills use calibrated "
+            "per-head sparse attention.",
+        )
+    if ctx.sparse_prefill_enabled:
+        return _cap(
+            "sparse_prefill",
+            label,
+            "needs-config",
+            "sparse_prefill_enabled is set but no calibration file was "
+            "found — prefill stays dense. Run "
+            "`python -m omlx.sparse_calibration --model <model>` once.",
+            catalog=(
+                [f"expected calibration: {ctx.sparse_prefill_calibration_path}"]
+                if ctx.sparse_prefill_calibration_path
+                else None
+            ),
+        )
+    if ctx.specprefill_enabled:
+        return _cap(
+            "sparse_prefill",
+            label,
+            "available",
+            "Available, but mutually exclusive with the active SpecPrefill "
+            "path — both reshape prefill attention.",
+        )
+    if ctx.sparse_prefill_calibrated:
+        return _cap(
+            "sparse_prefill",
+            label,
+            "available",
+            "A calibration file exists for this model; sparse prefill can "
+            "be enabled from here.",
+        )
+    return _cap(
+        "sparse_prefill",
+        label,
+        "needs-config",
+        "Draft-free sparse prefill cuts long-prompt TTFT, but needs a "
+        "one-time offline calibration: "
+        "`python -m omlx.sparse_calibration --model <model>`.",
+        catalog=(
+            [f"expected calibration: {ctx.sparse_prefill_calibration_path}"]
+            if ctx.sparse_prefill_calibration_path
+            else None
+        ),
+    )
+
+
 def build_capabilities(ctx: CapabilityContext) -> list[dict]:
     """Capability matrix in fixed feature order."""
     return [
         _mtp_capability(ctx),
         _dflash_capability(ctx),
         _vlm_mtp_capability(ctx),
+        _ngram_spec_capability(ctx),
         _specprefill_capability(ctx),
+        _sparse_prefill_capability(ctx),
+        _chunk_kv_reuse_capability(ctx),
         _turboquant_capability(ctx),
     ]

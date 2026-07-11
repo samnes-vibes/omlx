@@ -236,6 +236,9 @@ class TestCollectSettingsPayload:
                 mtp_draft_depth=1,
                 mtp_tuned_depth=2,
                 mtp_head_quantized=True,  # warn, no action — must be skipped
+                chunk_kv_reuse_enabled=True,
+                sparse_prefill_enabled=True,
+                sparse_prefill_calibrated=True,
             )
         )
         payload, ids = collect_settings_payload(recs)
@@ -244,7 +247,12 @@ class TestCollectSettingsPayload:
 
     def test_untuned_model_yields_enable_only(self):
         recs = build_recommendations(
-            RecommendationContext(mtp_compatible=True)
+            RecommendationContext(
+                mtp_compatible=True,
+                chunk_kv_reuse_enabled=True,
+                sparse_prefill_enabled=True,
+                sparse_prefill_calibrated=True,
+            )
         )
         payload, ids = collect_settings_payload(recs)
         assert payload == {"mtp_enabled": True}
@@ -252,7 +260,13 @@ class TestCollectSettingsPayload:
 
     def test_empty_when_nothing_actionable(self):
         recs = build_recommendations(
-            RecommendationContext(dflash_compatible=True)
+            RecommendationContext(
+                dflash_compatible=True,
+                ngram_spec_enabled=True,  # suppresses the actionable specs
+                chunk_kv_reuse_enabled=True,
+                sparse_prefill_enabled=True,
+                sparse_prefill_calibrated=True,
+            )
         )
         payload, ids = collect_settings_payload(recs)
         assert payload == {}
@@ -321,7 +335,12 @@ class TestEstimatedGain:
     def test_best_estimated_gain_none_when_nothing_estimated(self):
         recs = build_recommendations(
             RecommendationContext(
-                mtp_compatible=True, mtp_enabled=True, mtp_head_quantized=True
+                mtp_compatible=True,
+                mtp_enabled=True,
+                mtp_head_quantized=True,
+                chunk_kv_reuse_enabled=True,
+                sparse_prefill_enabled=True,
+                sparse_prefill_calibrated=True,
             )
         )
         assert best_estimated_gain(recs) is None
@@ -412,4 +431,89 @@ class TestOrderingAndEmpty:
         assert recs[0]["id"] == "mtp-quantized-head"
 
     def test_nothing_to_say(self):
-        assert build_recommendations(RecommendationContext()) == []
+        # Every feature already on (or resolved) — no advice left to give.
+        assert (
+            build_recommendations(
+                RecommendationContext(
+                    ngram_spec_enabled=True,
+                    chunk_kv_reuse_enabled=True,
+                    sparse_prefill_enabled=True,
+                    sparse_prefill_calibrated=True,
+                )
+            )
+            == []
+        )
+
+
+class TestIntegrationFeatureRules:
+    """Rules for the integration-branch features (ngram, sparse, chunk-KV)."""
+
+    def test_ngram_fires_when_mtp_unavailable_and_nothing_on(self):
+        recs = build_recommendations(RecommendationContext())
+        rec = next(r for r in recs if r["id"] == "ngram-spec-enable")
+        assert rec["severity"] == "suggest"
+        assert rec["action"] == {
+            "type": "settings",
+            "payload": {"ngram_spec_enabled": True},
+        }
+        assert rec["estimated_gain"] == {"class": "medium", "basis": "heuristic"}
+
+    def test_ngram_suppressed_when_mtp_compatible(self):
+        recs = build_recommendations(RecommendationContext(mtp_compatible=True))
+        assert not any(r["id"] == "ngram-spec-enable" for r in recs)
+
+    def test_ngram_suppressed_when_any_speculative_on(self):
+        for flag in (
+            "mtp_enabled",
+            "dflash_enabled",
+            "vlm_mtp_enabled",
+            "ngram_spec_enabled",
+        ):
+            recs = build_recommendations(RecommendationContext(**{flag: True}))
+            assert not any(r["id"] == "ngram-spec-enable" for r in recs), flag
+
+    def test_mtp_enable_suppressed_when_ngram_on(self):
+        recs = build_recommendations(
+            RecommendationContext(mtp_compatible=True, ngram_spec_enabled=True)
+        )
+        assert not any(r["id"] == "mtp-enable" for r in recs)
+
+    def test_sparse_prefill_enable_when_calibrated(self):
+        recs = build_recommendations(
+            RecommendationContext(sparse_prefill_calibrated=True)
+        )
+        rec = next(r for r in recs if r["id"] == "sparse-prefill-enable")
+        assert rec["severity"] == "suggest"
+        assert rec["action"]["payload"] == {"sparse_prefill_enabled": True}
+        assert not any(r["id"] == "sparse-prefill-calibrate" for r in recs)
+
+    def test_sparse_prefill_calibrate_advice_when_not_calibrated(self):
+        recs = build_recommendations(RecommendationContext())
+        rec = next(r for r in recs if r["id"] == "sparse-prefill-calibrate")
+        assert rec["severity"] == "info"
+        assert rec["action"] is None
+
+    def test_sparse_prefill_suppressed_when_on_or_specprefill(self):
+        recs = build_recommendations(
+            RecommendationContext(
+                sparse_prefill_enabled=True, sparse_prefill_calibrated=True
+            )
+        )
+        assert not any(r["id"].startswith("sparse-prefill") for r in recs)
+        recs = build_recommendations(
+            RecommendationContext(specprefill_enabled=True)
+        )
+        assert not any(r["id"].startswith("sparse-prefill") for r in recs)
+
+    def test_chunk_kv_reuse_fires_with_action(self):
+        recs = build_recommendations(RecommendationContext())
+        rec = next(r for r in recs if r["id"] == "chunk-kv-reuse-candidate")
+        assert rec["severity"] == "info"
+        assert rec["action"]["payload"] == {"chunk_kv_reuse_enabled": True}
+
+    def test_chunk_kv_reuse_suppressed_by_dflash_and_turboquant(self):
+        for flag in ("dflash_enabled", "turboquant_kv_enabled", "chunk_kv_reuse_enabled"):
+            recs = build_recommendations(RecommendationContext(**{flag: True}))
+            assert not any(
+                r["id"] == "chunk-kv-reuse-candidate" for r in recs
+            ), flag

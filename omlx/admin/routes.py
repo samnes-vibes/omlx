@@ -2173,8 +2173,26 @@ def _build_recommendations_for(model_id: str) -> list[dict]:
         ),
         mtp_tune_entry=tune_entry,
         ab_trial_results=ab_results,
+        ngram_spec_enabled=bool(getattr(settings, "ngram_spec_enabled", False)),
+        chunk_kv_reuse_enabled=bool(
+            getattr(settings, "chunk_kv_reuse_enabled", False)
+        ),
+        sparse_prefill_enabled=bool(
+            getattr(settings, "sparse_prefill_enabled", False)
+        ),
+        sparse_prefill_calibrated=_sparse_prefill_calibration_path(
+            settings, model_key
+        ).exists(),
     )
     return build_recommendations(ctx)
+
+
+def _sparse_prefill_calibration_path(settings, model_key: str) -> Path:
+    """Effective calibration-file path for this (model, settings) pair."""
+    from ..patches.sparse_prefill import default_calibration_path
+
+    override = getattr(settings, "sparse_prefill_calibration_file", None)
+    return Path(override) if override else default_calibration_path(model_key)
 
 
 @router.get("/api/models/{model_id}/recommendations")
@@ -2267,6 +2285,8 @@ def _build_capabilities_for(model_id: str) -> list[dict]:
             mtp_tuned_winner_depth = int(tune_entry["depth"])
             mtp_tuned_at = tune_entry.get("tuned_at")
 
+    sparse_calib_path = _sparse_prefill_calibration_path(settings, model_path.name)
+
     ctx = CapabilityContext(
         model_type=model_type,
         has_vision=bool(cfg.get("vision_config")),
@@ -2292,6 +2312,15 @@ def _build_capabilities_for(model_id: str) -> list[dict]:
         mtp_runtime=mtp_runtime,
         mtp_tuned_winner_depth=mtp_tuned_winner_depth,
         mtp_tuned_at=mtp_tuned_at,
+        ngram_spec_enabled=bool(getattr(settings, "ngram_spec_enabled", False)),
+        chunk_kv_reuse_enabled=bool(
+            getattr(settings, "chunk_kv_reuse_enabled", False)
+        ),
+        sparse_prefill_enabled=bool(
+            getattr(settings, "sparse_prefill_enabled", False)
+        ),
+        sparse_prefill_calibrated=sparse_calib_path.exists(),
+        sparse_prefill_calibration_path=str(sparse_calib_path),
     )
     return build_capabilities(ctx)
 
